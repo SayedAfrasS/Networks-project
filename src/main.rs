@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod ai;
 mod congestion;
 mod emulator;
 mod experiment;
@@ -14,6 +15,7 @@ use std::io::{self, BufRead, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
+use ai::AiCongestionController;
 use congestion::{CongestionController, PredictiveController, SimpleAimd};
 use emulator::{NetworkEmulator, SendOutcome};
 use experiment::{ExperimentLogger, ExperimentResult};
@@ -248,6 +250,7 @@ fn send_scheduled_packets(
                         );
 
                         metrics.record_retransmit();
+                        controller.on_retransmit();
 
                         let _ = telemetry.log(
                             "retransmit",
@@ -418,6 +421,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
     println!("              Run repeated batch experiments");
     println!("  aimd        Switch to baseline AIMD controller");
     println!("  predictive  Switch to predictive controller");
+    println!("  ai          Switch to simple AI controller");
     println!("  controller  Show current controller");
     println!("  reset       Reset metrics");
     println!("  loss <p>    Set loss percent");
@@ -486,6 +490,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("              Run repeated batch experiments");
                 println!("  aimd        Switch to baseline AIMD controller");
                 println!("  predictive  Switch to predictive controller");
+                println!("  ai          Switch to simple AI controller");
                 println!("  controller  Show current controller");
                 println!("  reset       Reset metrics");
                 println!("  loss <p>    Set loss percent");
@@ -548,6 +553,17 @@ fn run_client(server_address: &str) -> io::Result<()> {
             }
             "predictive" => {
                 controller = Box::new(PredictiveController::new(1200));
+
+                let message = format!("switched to {}", controller.name());
+
+                println!("Switched to {}", controller.name());
+
+                let _ = telemetry.log("controller_switch", &message);
+
+                continue;
+            }
+            "ai" => {
+                controller = Box::new(AiCongestionController::new(1200));
 
                 let message = format!("switched to {}", controller.name());
 
