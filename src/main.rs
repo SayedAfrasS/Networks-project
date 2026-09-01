@@ -7,6 +7,7 @@ mod experiment;
 mod features;
 mod metrics;
 mod packet;
+mod report;
 mod scheduler;
 mod telemetry;
 
@@ -419,6 +420,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
     println!("  batch       Send demo packets");
     println!("  experiment <runs>");
     println!("              Run repeated batch experiments");
+    println!("  summary     Generate summary report from experiment results");
     println!("  aimd        Switch to baseline AIMD controller");
     println!("  predictive  Switch to predictive controller");
     println!("  ai          Switch to simple AI controller");
@@ -488,6 +490,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("  batch       Send demo packets");
                 println!("  experiment <runs>");
                 println!("              Run repeated batch experiments");
+                println!("  summary     Generate summary report from experiment results");
                 println!("  aimd        Switch to baseline AIMD controller");
                 println!("  predictive  Switch to predictive controller");
                 println!("  ai          Switch to simple AI controller");
@@ -533,6 +536,36 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("Features: {}", features_text);
 
                 let _ = telemetry.log("features", &features_text);
+
+                continue;
+            }
+            "summary" => {
+                println!("Reading experiment_results.csv...");
+
+                match report::summarize_experiment_csv(
+                    "experiment_results.csv",
+                    "summary_results.csv",
+                ) {
+                    Ok(rows) => {
+                        println!("Summary written to summary_results.csv");
+
+                        if rows.is_empty() {
+                            println!("No experiment rows found.");
+                        } else {
+                            for row in &rows {
+                                println!("{}", row.short());
+                            }
+                        }
+
+                        let _ = telemetry.log(
+                            "summary_generated",
+                            &format!("rows={}", rows.len()),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Summary failed: {}", e);
+                    }
+                }
 
                 continue;
             }
