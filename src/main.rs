@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod congestion;
+mod features;
 mod metrics;
 mod packet;
 mod scheduler;
@@ -11,7 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use congestion::{CongestionController, SimpleAimd};
+use congestion::{CongestionController, PredictiveController, SimpleAimd};
 use metrics::Metrics;
 use packet::{decode_packet, encode_packet, Packet, Reliability, TYPE_ACK, TYPE_DATA};
 use scheduler::{PriorityScheduler, ScheduledPacket};
@@ -276,7 +277,9 @@ fn run_client(server_address: &str) -> io::Result<()> {
     socket.connect(server_address)?;
     socket.set_read_timeout(Some(Duration::from_millis(400)))?;
 
-    let mut controller = SimpleAimd::new(1200);
+    let mut controller: Box<dyn CongestionController> =
+        Box::new(PredictiveController::new(1200));
+
     let mut telemetry = TelemetryLogger::new("telemetry.jsonl")?;
     let mut scheduler = PriorityScheduler::new();
     let mut metrics = Metrics::new();
@@ -287,7 +290,16 @@ fn run_client(server_address: &str) -> io::Result<()> {
     println!();
     println!("Normal format: <reliability> <priority> <message>");
     println!("Reliability values: be | important | guaranteed");
-    println!("Extra commands: stats | batch | help | exit");
+    println!("Extra commands:");
+    println!("  stats      Show metrics and features");
+    println!("  features   Show feature extraction details");
+    println!("  batch      Send demo packets");
+    println!("  aimd       Switch to baseline AIMD controller");
+    println!("  predictive Switch to predictive controller");
+    println!("  controller Show current controller");
+    println!("  reset      Reset metrics");
+    println!("  help       Show help");
+    println!("  exit       Quit");
     println!();
 
     let _ = telemetry.log(
@@ -338,23 +350,74 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("Reliability values: be | important | guaranteed");
                 println!();
                 println!("Commands:");
-                println!("  stats   Show metrics summary");
-                println!("  batch   Send demo packets using priority scheduler");
-                println!("  help    Show this help");
-                println!("  exit    Quit client");
+                println!("  stats      Show metrics and features");
+                println!("  features   Show feature extraction details");
+                println!("  batch      Send demo packets");
+                println!("  aimd       Switch to baseline AIMD controller");
+                println!("  predictive Switch to predictive controller");
+                println!("  controller Show current controller");
+                println!("  reset      Reset metrics");
+                println!("  help       Show this help");
+                println!("  exit       Quit client");
                 continue;
             }
             "stats" => {
                 let controller_status = controller.status();
+                let features_text = controller.features_text();
                 let summary = metrics.summary();
 
                 println!("Controller status: {}", controller_status);
+                println!("Features: {}", features_text);
                 println!("Metrics summary: {}", summary);
 
                 let _ = telemetry.log(
                     "stats",
-                    &format!("{} {}", controller_status, summary),
+                    &format!("{} {} {}", controller_status, features_text, summary),
                 );
+
+                continue;
+            }
+            "features" => {
+                let features_text = controller.features_text();
+
+                println!("Features: {}", features_text);
+
+                let _ = telemetry.log("features", &features_text);
+
+                continue;
+            }
+            "controller" => {
+                println!("Current controller: {}", controller.name());
+                continue;
+            }
+            "aimd" => {
+                controller = Box::new(SimpleAimd::new(1200));
+
+                let message = format!("switched to {}", controller.name());
+
+                println!("Switched to {}", controller.name());
+
+                let _ = telemetry.log("controller_switch", &message);
+
+                continue;
+            }
+            "predictive" => {
+                controller = Box::new(PredictiveController::new(1200));
+
+                let message = format!("switched to {}", controller.name());
+
+                println!("Switched to {}", controller.name());
+
+                let _ = telemetry.log("controller_switch", &message);
+
+                continue;
+            }
+            "reset" => {
+                metrics = Metrics::new();
+
+                println!("Metrics reset");
+
+                let _ = telemetry.log("metrics_reset", "metrics reset");
 
                 continue;
             }
@@ -405,7 +468,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 send_scheduled_packets(
                     &socket,
                     &mut scheduler,
-                    &mut controller,
+                    &mut *controller,
                     &mut telemetry,
                     &mut metrics,
                 )?;
@@ -469,7 +532,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
         send_scheduled_packets(
             &socket,
             &mut scheduler,
-            &mut controller,
+            &mut *controller,
             &mut telemetry,
             &mut metrics,
         )?;
