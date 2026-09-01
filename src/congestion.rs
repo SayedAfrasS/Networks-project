@@ -18,6 +18,14 @@ pub trait CongestionController {
     fn features_text(&self) -> String {
         String::from("no feature extraction")
     }
+
+    fn cwnd_bytes(&self) -> usize {
+        0
+    }
+
+    fn risk(&self) -> f64 {
+        0.0
+    }
 }
 
 pub struct SimpleAimd {
@@ -93,6 +101,14 @@ impl CongestionController for SimpleAimd {
             "simple-aimd cwnd_bytes={} in_flight_bytes={} mss={}",
             self.cwnd_bytes, self.in_flight_bytes, self.mss
         )
+    }
+
+        fn cwnd_bytes(&self) -> usize {
+        self.cwnd_bytes
+    }
+
+    fn risk(&self) -> f64 {
+        0.0
     }
 }
 
@@ -252,5 +268,13 @@ impl CongestionController for PredictiveController {
             features.loss_rate,
             features.risk
         )
+    }
+
+    fn cwnd_bytes(&self) -> usize {
+        self.cwnd_bytes
+    }
+
+    fn risk(&self) -> f64 {
+        0.0
     }
 }
