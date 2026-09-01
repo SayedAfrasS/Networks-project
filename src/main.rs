@@ -2,6 +2,7 @@
 
 mod congestion;
 mod emulator;
+mod experiment;
 mod features;
 mod metrics;
 mod packet;
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use congestion::{CongestionController, PredictiveController, SimpleAimd};
 use emulator::{NetworkEmulator, SendOutcome};
+use experiment::{ExperimentLogger, ExperimentResult};
 use metrics::Metrics;
 use packet::{decode_packet, encode_packet, Packet, Reliability, TYPE_ACK, TYPE_DATA};
 use scheduler::{PriorityScheduler, ScheduledPacket};
@@ -84,6 +86,54 @@ fn wait_for_ack(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+fn enqueue_demo_batch(
+    scheduler: &mut PriorityScheduler,
+    seq: &mut u32,
+    connection_id: u32,
+    stream_id: u32,
+) {
+    println!("Enqueuing demo packets...");
+
+    let demo_packets = vec![
+        (Reliability::BestEffort, 0, "demo best effort"),
+        (Reliability::Important, 2, "demo sensor"),
+        (Reliability::Important, 6, "demo alert"),
+        (Reliability::Guaranteed, 4, "demo file chunk"),
+        (Reliability::Guaranteed, 7, "demo critical control"),
+    ];
+
+    for (reliability, priority, message) in demo_packets {
+        let packet = encode_packet(
+            TYPE_DATA,
+            reliability,
+            priority,
+            connection_id,
+            stream_id,
+            *seq,
+            0,
+            message.as_bytes(),
+        );
+
+        println!(
+            "Enqueued seq={} prio={} rel={:?} payload={:?}",
+            *seq,
+            priority,
+            reliability,
+            message
+        );
+
+        scheduler.enqueue(ScheduledPacket {
+            priority,
+            seq: *seq,
+            reliability,
+            encoded: packet,
+            payload_preview: message.to_string(),
+        });
+
+        *seq = (*seq).wrapping_add(1);
     }
 }
 
@@ -364,6 +414,8 @@ fn run_client(server_address: &str) -> io::Result<()> {
     println!("  stats       Show metrics and features");
     println!("  features    Show feature extraction details");
     println!("  batch       Send demo packets");
+    println!("  experiment <runs>");
+    println!("              Run repeated batch experiments");
     println!("  aimd        Switch to baseline AIMD controller");
     println!("  predictive  Switch to predictive controller");
     println!("  controller  Show current controller");
@@ -430,6 +482,8 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("  stats       Show metrics and features");
                 println!("  features    Show feature extraction details");
                 println!("  batch       Send demo packets");
+                println!("  experiment <runs>");
+                println!("              Run repeated batch experiments");
                 println!("  aimd        Switch to baseline AIMD controller");
                 println!("  predictive  Switch to predictive controller");
                 println!("  controller  Show current controller");
@@ -600,44 +654,116 @@ fn run_client(server_address: &str) -> io::Result<()> {
 
                 continue;
             }
-            "batch" | "demo" => {
-                println!("Enqueuing demo packets...");
+            "experiment" | "exp" => {
+                let runs = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("5")
+                    .parse::<u32>()
+                    .unwrap_or(5)
+                    .clamp(1, 100);
 
-                let demo_packets = vec![
-                    (Reliability::BestEffort, 0, "demo best effort"),
-                    (Reliability::Important, 2, "demo sensor"),
-                    (Reliability::Important, 6, "demo alert"),
-                    (Reliability::Guaranteed, 4, "demo file chunk"),
-                    (Reliability::Guaranteed, 7, "demo critical control"),
-                ];
+                println!(
+                    "Starting experiment: runs={} controller={} emulator={}",
+                    runs,
+                    controller.name(),
+                    emulator.status()
+                );
 
-                for (reliability, priority, message) in demo_packets {
-                    let packet = encode_packet(
-                        TYPE_DATA,
-                        reliability,
-                        priority,
+                let mut logger = match ExperimentLogger::new("experiment_results.csv") {
+                    Ok(logger) => logger,
+                    Err(e) => {
+                        eprintln!("Failed to open experiment_results.csv: {}", e);
+                        continue;
+                    }
+                };
+
+                for run_id in 1..=runs {
+                    metrics = Metrics::new();
+                    scheduler = PriorityScheduler::new();
+
+                    let start = Instant::now();
+
+                    enqueue_demo_batch(
+                        &mut scheduler,
+                        &mut seq,
                         connection_id,
                         stream_id,
-                        seq,
-                        0,
-                        message.as_bytes(),
                     );
+
+                    if let Err(e) = send_scheduled_packets(
+                        &socket,
+                        &mut scheduler,
+                        &mut *controller,
+                        &mut telemetry,
+                        &mut metrics,
+                        &mut emulator,
+                    ) {
+                        eprintln!("Experiment run failed: {}", e);
+                        break;
+                    }
+
+                    let duration = start.elapsed();
+
+                    let rtt_avg_us = if metrics.rtt_samples == 0 {
+                        0
+                    } else {
+                        metrics.rtt_sum_us / metrics.rtt_samples as u128
+                    };
+
+                    let result = ExperimentResult {
+                        timestamp_us: experiment::timestamp_us(),
+                        run_id,
+
+                        controller: controller.name().to_string(),
+                        emulator: emulator.status(),
+
+                        sent_total: metrics.sent_total,
+                        sent_best_effort: metrics.sent_best_effort,
+                        sent_important: metrics.sent_important,
+                        sent_guaranteed: metrics.sent_guaranteed,
+
+                        acks: metrics.acks,
+                        losses: metrics.losses,
+                        retransmits: metrics.retransmits,
+
+                        rtt_samples: metrics.rtt_samples,
+                        rtt_avg_us,
+                        rtt_min_us: metrics.rtt_min_us.unwrap_or(0),
+                        rtt_max_us: metrics.rtt_max_us.unwrap_or(0),
+
+                        final_cwnd_bytes: controller.cwnd_bytes(),
+                        final_risk: controller.risk(),
+
+                        duration_ms: duration.as_millis(),
+                    };
+
+                    if let Err(e) = logger.write_result(&result) {
+                        eprintln!("Failed to write experiment result: {}", e);
+                        break;
+                    }
 
                     println!(
-                        "Enqueued seq={} prio={} rel={:?} payload={:?}",
-                        seq, priority, reliability, message
+                        "[EXPERIMENT] run {}/{} done: {}",
+                        run_id,
+                        runs,
+                        result.summary_short()
                     );
 
-                    scheduler.enqueue(ScheduledPacket {
-                        priority,
-                        seq,
-                        reliability,
-                        encoded: packet,
-                        payload_preview: message.to_string(),
-                    });
-
-                    seq = seq.wrapping_add(1);
+                    std::thread::sleep(Duration::from_millis(100));
                 }
+
+                println!("Experiment complete. Results saved to experiment_results.csv");
+
+                continue;
+            }
+            "batch" | "demo" => {
+                enqueue_demo_batch(
+                    &mut scheduler,
+                    &mut seq,
+                    connection_id,
+                    stream_id,
+                );
 
                 let _ = telemetry.log(
                     "batch_enqueued",
