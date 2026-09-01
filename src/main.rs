@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod congestion;
+mod emulator;
 mod features;
 mod metrics;
 mod packet;
@@ -13,10 +14,25 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use congestion::{CongestionController, PredictiveController, SimpleAimd};
+use emulator::{NetworkEmulator, SendOutcome};
 use metrics::Metrics;
 use packet::{decode_packet, encode_packet, Packet, Reliability, TYPE_ACK, TYPE_DATA};
 use scheduler::{PriorityScheduler, ScheduledPacket};
 use telemetry::TelemetryLogger;
+
+fn parse_percent(value: &str) -> f64 {
+    let parsed = value.parse::<f64>().unwrap_or(0.0);
+
+    if parsed.is_finite() {
+        parsed.clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
+fn parse_ms(value: &str) -> u64 {
+    value.parse::<u64>().unwrap_or(0).min(10_000)
+}
 
 fn send_ack(socket: &UdpSocket, destination: SocketAddr, packet: &Packet) -> io::Result<usize> {
     let ack_packet = encode_packet(
@@ -33,10 +49,13 @@ fn send_ack(socket: &UdpSocket, destination: SocketAddr, packet: &Packet) -> io:
     socket.send_to(&ack_packet, destination)
 }
 
-fn wait_for_ack(socket: &UdpSocket, expected_seq: u32) -> io::Result<bool> {
+fn wait_for_ack(
+    socket: &UdpSocket,
+    expected_seq: u32,
+    timeout: Duration,
+) -> io::Result<bool> {
     let mut buffer = [0u8; 65535];
 
-    let timeout = Duration::from_millis(400);
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -74,6 +93,7 @@ fn send_scheduled_packets(
     controller: &mut dyn CongestionController,
     telemetry: &mut TelemetryLogger,
     metrics: &mut Metrics,
+    emulator: &mut NetworkEmulator,
 ) -> io::Result<()> {
     while let Some(item) = scheduler.pop_next() {
         let packet_len = item.encoded.len();
@@ -101,12 +121,27 @@ fn send_scheduled_packets(
         );
 
         if item.reliability == Reliability::BestEffort {
-            socket.send(&item.encoded)?;
+            let outcome = emulator.send_packet(socket, &item.encoded)?;
 
-            println!(
-                "Sent best-effort seq={}; no ACK expected",
-                item.seq
-            );
+            match outcome {
+                SendOutcome::Sent => {
+                    println!(
+                        "Sent best-effort seq={}; no ACK expected",
+                        item.seq
+                    );
+                }
+                SendOutcome::Dropped => {
+                    println!(
+                        "[EMULATOR] dropped best-effort seq={}",
+                        item.seq
+                    );
+
+                    let _ = telemetry.log(
+                        "emulator_drop",
+                        &format!("seq={} rel=BestEffort", item.seq),
+                    );
+                }
+            }
 
             continue;
         }
@@ -120,7 +155,23 @@ fn send_scheduled_packets(
 
         let start_time = Instant::now();
 
-        socket.send(&item.encoded)?;
+        let outcome = emulator.send_packet(socket, &item.encoded)?;
+
+        if outcome == SendOutcome::Dropped {
+            println!(
+                "[EMULATOR] dropped seq={} on attempt 1",
+                item.seq
+            );
+
+            let _ = telemetry.log(
+                "emulator_drop",
+                &format!("seq={} attempt=1", item.seq),
+            );
+        }
+
+        let ack_timeout = Duration::from_millis(
+            400u64.saturating_add(emulator.max_delay_ms().saturating_mul(2)),
+        );
 
         let max_attempts: u32 = match item.reliability {
             Reliability::Important => 3,
@@ -132,7 +183,7 @@ fn send_scheduled_packets(
         let mut acked = false;
 
         while attempt <= max_attempts {
-            match wait_for_ack(socket, item.seq) {
+            match wait_for_ack(socket, item.seq, ack_timeout) {
                 Ok(true) => {
                     acked = true;
                     break;
@@ -158,7 +209,24 @@ fn send_scheduled_packets(
                             ),
                         );
 
-                        socket.send(&item.encoded)?;
+                        let outcome = emulator.send_packet(socket, &item.encoded)?;
+
+                        if outcome == SendOutcome::Dropped {
+                            println!(
+                                "[EMULATOR] dropped seq={} on attempt {}",
+                                item.seq,
+                                attempt + 1
+                            );
+
+                            let _ = telemetry.log(
+                                "emulator_drop",
+                                &format!(
+                                    "seq={} attempt={}",
+                                    item.seq,
+                                    attempt + 1
+                                ),
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -283,32 +351,41 @@ fn run_client(server_address: &str) -> io::Result<()> {
     let mut telemetry = TelemetryLogger::new("telemetry.jsonl")?;
     let mut scheduler = PriorityScheduler::new();
     let mut metrics = Metrics::new();
+    let mut emulator = NetworkEmulator::new();
 
     println!("Client ready. Sending to {}", server_address);
     println!("Congestion controller: {}", controller.name());
     println!("Controller status: {}", controller.status());
+    println!("Emulator: {}", emulator.status());
     println!();
     println!("Normal format: <reliability> <priority> <message>");
     println!("Reliability values: be | important | guaranteed");
     println!("Extra commands:");
-    println!("  stats      Show metrics and features");
-    println!("  features   Show feature extraction details");
-    println!("  batch      Send demo packets");
-    println!("  aimd       Switch to baseline AIMD controller");
-    println!("  predictive Switch to predictive controller");
-    println!("  controller Show current controller");
-    println!("  reset      Reset metrics");
-    println!("  help       Show help");
-    println!("  exit       Quit");
+    println!("  stats       Show metrics and features");
+    println!("  features    Show feature extraction details");
+    println!("  batch       Send demo packets");
+    println!("  aimd        Switch to baseline AIMD controller");
+    println!("  predictive  Switch to predictive controller");
+    println!("  controller  Show current controller");
+    println!("  reset       Reset metrics");
+    println!("  loss <p>    Set loss percent");
+    println!("  delay <ms>  Set delay in ms");
+    println!("  jitter <ms> Set jitter in ms");
+    println!("  scenario <good|lossy|bad>");
+    println!("  emulation   Show emulator settings");
+    println!("  clear       Clear emulator settings");
+    println!("  help        Show help");
+    println!("  exit        Quit");
     println!();
 
     let _ = telemetry.log(
         "client_start",
         &format!(
-            "server={} controller={} {}",
+            "server={} controller={} {} emulator={}",
             server_address,
             controller.name(),
-            controller.status()
+            controller.status(),
+            emulator.status()
         ),
     );
 
@@ -350,29 +427,43 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("Reliability values: be | important | guaranteed");
                 println!();
                 println!("Commands:");
-                println!("  stats      Show metrics and features");
-                println!("  features   Show feature extraction details");
-                println!("  batch      Send demo packets");
-                println!("  aimd       Switch to baseline AIMD controller");
-                println!("  predictive Switch to predictive controller");
-                println!("  controller Show current controller");
-                println!("  reset      Reset metrics");
-                println!("  help       Show this help");
-                println!("  exit       Quit client");
+                println!("  stats       Show metrics and features");
+                println!("  features    Show feature extraction details");
+                println!("  batch       Send demo packets");
+                println!("  aimd        Switch to baseline AIMD controller");
+                println!("  predictive  Switch to predictive controller");
+                println!("  controller  Show current controller");
+                println!("  reset       Reset metrics");
+                println!("  loss <p>    Set loss percent");
+                println!("  delay <ms>  Set delay in ms");
+                println!("  jitter <ms> Set jitter in ms");
+                println!("  scenario <good|lossy|bad>");
+                println!("  emulation   Show emulator settings");
+                println!("  clear       Clear emulator settings");
+                println!("  help        Show this help");
+                println!("  exit        Quit client");
                 continue;
             }
             "stats" => {
                 let controller_status = controller.status();
                 let features_text = controller.features_text();
                 let summary = metrics.summary();
+                let emulator_status = emulator.status();
 
                 println!("Controller status: {}", controller_status);
                 println!("Features: {}", features_text);
+                println!("Emulator: {}", emulator_status);
                 println!("Metrics summary: {}", summary);
 
                 let _ = telemetry.log(
                     "stats",
-                    &format!("{} {} {}", controller_status, features_text, summary),
+                    &format!(
+                        "{} {} {} {}",
+                        controller_status,
+                        features_text,
+                        emulator_status,
+                        summary
+                    ),
                 );
 
                 continue;
@@ -418,6 +509,94 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("Metrics reset");
 
                 let _ = telemetry.log("metrics_reset", "metrics reset");
+
+                continue;
+            }
+            "loss" => {
+                let value = line.split_whitespace().nth(1).unwrap_or("0");
+                let percent = parse_percent(value);
+
+                emulator.set_loss(percent);
+
+                println!("Loss set: {}", emulator.status());
+
+                let _ = telemetry.log("emulation_loss", &emulator.status());
+
+                continue;
+            }
+            "delay" => {
+                let value = line.split_whitespace().nth(1).unwrap_or("0");
+                let ms = parse_ms(value);
+
+                emulator.set_delay(ms);
+
+                println!("Delay set: {}", emulator.status());
+
+                let _ = telemetry.log("emulation_delay", &emulator.status());
+
+                continue;
+            }
+            "jitter" => {
+                let value = line.split_whitespace().nth(1).unwrap_or("0");
+                let ms = parse_ms(value);
+
+                emulator.set_jitter(ms);
+
+                println!("Jitter set: {}", emulator.status());
+
+                let _ = telemetry.log("emulation_jitter", &emulator.status());
+
+                continue;
+            }
+            "scenario" => {
+                let name = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_lowercase();
+
+                match name.as_str() {
+                    "good" => {
+                        emulator.clear();
+                    }
+                    "lossy" => {
+                        emulator.set_loss(20.0);
+                        emulator.set_delay(20);
+                        emulator.set_jitter(10);
+                    }
+                    "bad" => {
+                        emulator.set_loss(35.0);
+                        emulator.set_delay(150);
+                        emulator.set_jitter(100);
+                    }
+                    _ => {
+                        println!("Unknown scenario. Use good, lossy, or bad.");
+                        continue;
+                    }
+                }
+
+                println!("Scenario '{}': {}", name, emulator.status());
+
+                let _ = telemetry.log(
+                    "emulation_scenario",
+                    &format!("scenario={} {}", name, emulator.status()),
+                );
+
+                continue;
+            }
+            "emulation" | "emu" => {
+                println!("Emulator: {}", emulator.status());
+
+                let _ = telemetry.log("emulation_status", &emulator.status());
+
+                continue;
+            }
+            "clear" => {
+                emulator.clear();
+
+                println!("Emulator cleared");
+
+                let _ = telemetry.log("emulation_clear", "cleared");
 
                 continue;
             }
@@ -471,6 +650,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                     &mut *controller,
                     &mut telemetry,
                     &mut metrics,
+                    &mut emulator,
                 )?;
 
                 continue;
@@ -535,6 +715,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
             &mut *controller,
             &mut telemetry,
             &mut metrics,
+            &mut emulator,
         )?;
     }
 
