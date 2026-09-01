@@ -13,6 +13,8 @@ pub trait CongestionController {
 
     fn on_loss(&mut self, packet_size: usize);
 
+    fn on_retransmit(&mut self) {}
+
     fn status(&self) -> String;
 
     fn features_text(&self) -> String {
@@ -103,7 +105,7 @@ impl CongestionController for SimpleAimd {
         )
     }
 
-        fn cwnd_bytes(&self) -> usize {
+    fn cwnd_bytes(&self) -> usize {
         self.cwnd_bytes
     }
 
@@ -179,7 +181,6 @@ impl CongestionController for PredictiveController {
 
         self.in_flight_bytes = self.in_flight_bytes.saturating_sub(packet_size);
 
-        // Proactive reduction if congestion risk is high.
         if features.risk >= 0.65 && self.acks_since_reduction >= 3 {
             self.cwnd_bytes = self
                 .cwnd_bytes
@@ -201,7 +202,6 @@ impl CongestionController for PredictiveController {
             self.cwnd_bytes = self.min_cwnd;
         }
 
-        // Increase only when risk is low.
         if features.risk < 0.35 {
             let increase = self
                 .mss
@@ -216,7 +216,6 @@ impl CongestionController for PredictiveController {
                 .saturating_add(increase)
                 .min(self.max_cwnd);
         } else if features.risk < 0.65 && self.ack_events % 8 == 0 {
-            // Very slow increase under medium risk.
             self.cwnd_bytes = self
                 .cwnd_bytes
                 .saturating_add(1)
@@ -275,6 +274,6 @@ impl CongestionController for PredictiveController {
     }
 
     fn risk(&self) -> f64 {
-        0.0
+        self.features.features().risk
     }
 }
