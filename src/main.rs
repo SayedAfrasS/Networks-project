@@ -6,6 +6,7 @@ mod emulator;
 mod experiment;
 mod features;
 mod metrics;
+mod mp_report;
 mod multipath;
 mod packet;
 mod report;
@@ -23,6 +24,7 @@ use congestion::{CongestionController, PredictiveController, SimpleAimd};
 use emulator::{NetworkEmulator, SendOutcome};
 use experiment::{ExperimentLogger, ExperimentResult};
 use metrics::Metrics;
+use mp_report::MultipathExperimentLogger;
 use multipath::MultipathManager;
 use packet::{decode_packet, encode_packet, Packet, Reliability, TYPE_ACK, TYPE_DATA};
 use scheduler::{PriorityScheduler, ScheduledPacket};
@@ -543,6 +545,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
     println!("  experiment <runs>");
     println!("              Run repeated batch experiments");
     println!("  summary     Generate summary report from experiment results");
+    println!("  mpsummary   Generate multipath summary report");
     println!("  aimd        Switch to baseline AIMD controller");
     println!("  predictive  Switch to predictive controller");
     println!("  ai          Switch to simple AI controller");
@@ -615,6 +618,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("  experiment <runs>");
                 println!("              Run repeated batch experiments");
                 println!("  summary     Generate summary report from experiment results");
+                println!("  mpsummary   Generate multipath summary report");
                 println!("  aimd        Switch to baseline AIMD controller");
                 println!("  predictive  Switch to predictive controller");
                 println!("  ai          Switch to simple AI controller");
@@ -692,6 +696,36 @@ fn run_client(server_address: &str) -> io::Result<()> {
                     }
                     Err(e) => {
                         eprintln!("Summary failed: {}", e);
+                    }
+                }
+
+                continue;
+            }
+            "mpsummary" => {
+                println!("Reading multipath_results.csv...");
+
+                match mp_report::summarize_multipath_csv(
+                    "multipath_results.csv",
+                    "multipath_summary.csv",
+                ) {
+                    Ok(rows) => {
+                        println!("Summary written to multipath_summary.csv");
+
+                        if rows.is_empty() {
+                            println!("No multipath experiment rows found.");
+                        } else {
+                            for row in &rows {
+                                println!("{}", row.short());
+                            }
+                        }
+
+                        let _ = telemetry.log(
+                            "multipath_summary_generated",
+                            &format!("rows={}", rows.len()),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Multipath summary failed: {}", e);
                     }
                 }
 
@@ -910,9 +944,25 @@ fn run_client(server_address: &str) -> io::Result<()> {
                     }
                 };
 
+                let mut mp_logger = if multipath.enabled {
+                    match MultipathExperimentLogger::new("multipath_results.csv") {
+                        Ok(logger) => Some(logger),
+                        Err(e) => {
+                            eprintln!("Failed to open multipath_results.csv: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 for run_id in 1..=runs {
                     metrics = Metrics::new();
                     scheduler = PriorityScheduler::new();
+
+                    if multipath.enabled {
+                        multipath.reset_stats();
+                    }
 
                     let start = Instant::now();
 
@@ -982,6 +1032,19 @@ fn run_client(server_address: &str) -> io::Result<()> {
                         break;
                     }
 
+                    if multipath.enabled {
+                        if let Some(mp_logger) = mp_logger.as_mut() {
+                            if let Err(e) = mp_logger.write_run(
+                                run_id,
+                                controller.name(),
+                                &multipath,
+                            ) {
+                                eprintln!("Failed to write multipath result: {}", e);
+                                break;
+                            }
+                        }
+                    }
+
                     println!(
                         "[EXPERIMENT] run {}/{} done: {}",
                         run_id,
@@ -993,6 +1056,10 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 }
 
                 println!("Experiment complete. Results saved to experiment_results.csv");
+
+                if multipath.enabled {
+                    println!("Multipath results saved to multipath_results.csv");
+                }
 
                 continue;
             }
