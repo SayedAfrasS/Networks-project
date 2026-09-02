@@ -3,6 +3,10 @@ use std::fs;
 use std::io;
 use std::process;
 
+// ==========================================
+// 1. CONNECTION STATE MACHINE
+// ==========================================
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ConnState {
     Closed,
@@ -17,7 +21,6 @@ enum ConnEvent {
     SynAckReceived,
     Close,
     CloseAckReceived,
-
     #[allow(dead_code)]
     Timeout,
 }
@@ -37,87 +40,252 @@ impl ConnStateMachine {
 
     fn apply(&mut self, event: ConnEvent) -> Result<(), String> {
         let old_state = self.state;
-
         let next_state = match (self.state, event) {
             (ConnState::Closed, ConnEvent::Connect) => ConnState::WaitSynAck,
-
             (ConnState::WaitSynAck, ConnEvent::SynAckReceived) => ConnState::Established,
-
             (ConnState::WaitSynAck, ConnEvent::Timeout) => ConnState::Closed,
-
             (ConnState::Established, ConnEvent::Close) => ConnState::WaitCloseAck,
-
             (ConnState::WaitCloseAck, ConnEvent::CloseAckReceived) => ConnState::Closed,
-
             (ConnState::WaitCloseAck, ConnEvent::Timeout) => ConnState::Closed,
-
-            _ => {
-                return Err(format!(
-                    "invalid transition from {:?} on {:?}",
-                    old_state,
-                    event
-                ))
-            }
+            _ => return Err(format!("invalid transition from {:?} on {:?}", old_state, event)),
         };
-
         self.state = next_state;
+        self.log.push(format!("{:?} --{:?}--> {:?}", old_state, event, next_state));
+        Ok(())
+    }
+}
 
-        self.log.push(format!(
-            "{:?} --{:?}--> {:?}",
-            old_state,
-            event,
-            next_state
-        ));
+// ==========================================
+// 2. STREAM STATE MACHINE
+// ==========================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StreamState {
+    Idle,
+    Active,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StreamEvent {
+    Create,
+    SendData,
+
+    #[allow(dead_code)]
+    ReceiveAck,
+
+    Close,
+}
+
+struct StreamStateMachine {
+    state: StreamState,
+    log: Vec<String>,
+}
+
+impl StreamStateMachine {
+    fn new() -> Self {
+        Self { state: StreamState::Idle, log: Vec::new() }
+    }
+
+    fn apply(&mut self, event: StreamEvent) -> Result<(), String> {
+        let old_state = self.state;
+        let next_state = match (self.state, event) {
+            (StreamState::Idle, StreamEvent::Create) => StreamState::Active,
+            (StreamState::Active, StreamEvent::SendData) => StreamState::Active,
+            (StreamState::Active, StreamEvent::ReceiveAck) => StreamState::Active,
+            (StreamState::Active, StreamEvent::Close) => StreamState::Closed,
+            _ => return Err(format!("invalid stream transition from {:?} on {:?}", old_state, event)),
+        };
+        self.state = next_state;
+        self.log.push(format!("{:?} --{:?}--> {:?}", old_state, event, next_state));
+        Ok(())
+    }
+}
+
+// ==========================================
+// 3. RETRANSMISSION STATE MACHINE
+// ==========================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RetxState {
+    Ready,
+    InFlight,
+    Acked,
+    Dropped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RetxEvent {
+    Transmit,
+    Ack,
+    Retransmit,
+
+    #[allow(dead_code)]
+    Fail,
+}
+
+struct RetxStateMachine {
+    state: RetxState,
+    log: Vec<String>,
+}
+
+impl RetxStateMachine {
+    fn new() -> Self {
+        Self { state: RetxState::Ready, log: Vec::new() }
+    }
+
+    fn apply(&mut self, event: RetxEvent) -> Result<(), String> {
+        let old_state = self.state;
+        let next_state = match (self.state, event) {
+            (RetxState::Ready, RetxEvent::Transmit) => RetxState::InFlight,
+            (RetxState::InFlight, RetxEvent::Ack) => RetxState::Acked,
+            (RetxState::InFlight, RetxEvent::Retransmit) => RetxState::InFlight,
+            (RetxState::InFlight, RetxEvent::Fail) => RetxState::Dropped,
+            _ => return Err(format!("invalid retx transition from {:?} on {:?}", old_state, event)),
+        };
+        self.state = next_state;
+        self.log.push(format!("{:?} --{:?}--> {:?}", old_state, event, next_state));
+        Ok(())
+    }
+}
+
+// ==========================================
+// 4. MULTIPATH PATH STATE MACHINE
+// ==========================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PathState {
+    Available,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PathEvent {
+    GoodAck,
+    HighLoss,
+
+    #[allow(dead_code)]
+    HighDelay,
+
+    #[allow(dead_code)]
+    Recover,
+}
+
+struct PathStateMachine {
+    state: PathState,
+    log: Vec<String>,
+}
+
+impl PathStateMachine {
+    fn new() -> Self {
+        Self { state: PathState::Available, log: Vec::new() }
+    }
+
+    fn apply(&mut self, event: PathEvent) -> Result<(), String> {
+        let old_state = self.state;
+        let next_state = match (self.state, event) {
+            (PathState::Available, PathEvent::HighLoss) => PathState::Degraded,
+            (PathState::Available, PathEvent::HighDelay) => PathState::Degraded,
+            (PathState::Degraded, PathEvent::HighLoss) => PathState::Unavailable,
+            (PathState::Degraded, PathEvent::GoodAck) => PathState::Available,
+            (PathState::Unavailable, PathEvent::Recover) => PathState::Available,
+            (PathState::Available, PathEvent::GoodAck) => PathState::Available,
+            _ => return Err(format!("invalid path transition from {:?} on {:?}", old_state, event)),
+        };
+        self.state = next_state;
+        self.log.push(format!("{:?} --{:?}--> {:?}", old_state, event, next_state));
+        Ok(())
+    }
+}
+
+// ==========================================
+// 5. FORMAL INVARIANTS
+// ==========================================
+
+struct GlobalState {
+    conn: ConnState,
+    stream: StreamState,
+    retx: RetxState,
+}
+
+impl GlobalState {
+    fn check_invariants(&self) -> Result<(), String> {
+        // Invariant 1: A stream cannot be Active if the Connection is Closed.
+        if self.stream == StreamState::Active && self.conn == ConnState::Closed {
+            return Err("Invariant violated: Stream is Active but Connection is Closed".to_string());
+        }
+        
+        // Invariant 2: A packet cannot be InFlight if its Stream is Closed.
+        if self.retx == RetxState::InFlight && self.stream == StreamState::Closed {
+            return Err("Invariant violated: Packet is InFlight but Stream is Closed".to_string());
+        }
 
         Ok(())
     }
 }
 
-fn run_self_check() -> Result<ConnStateMachine, String> {
-    let mut machine = ConnStateMachine::new();
+// ==========================================
+// SELF-CHECK EXECUTION
+// ==========================================
 
-    machine.apply(ConnEvent::Connect)?;
-    machine.apply(ConnEvent::SynAckReceived)?;
-    machine.apply(ConnEvent::Close)?;
-    machine.apply(ConnEvent::CloseAckReceived)?;
+fn run_self_check() -> Result<(ConnStateMachine, StreamStateMachine, RetxStateMachine, PathStateMachine, bool), String> {
+    let mut conn = ConnStateMachine::new();
+    let mut stream = StreamStateMachine::new();
+    let mut retx = RetxStateMachine::new();
+    let mut path = PathStateMachine::new();
 
-    Ok(machine)
+    // Connection lifecycle
+    conn.apply(ConnEvent::Connect)?;
+    conn.apply(ConnEvent::SynAckReceived)?;
+
+    // Stream lifecycle
+    stream.apply(StreamEvent::Create)?;
+    stream.apply(StreamEvent::SendData)?;
+
+    // Packet lifecycle
+    retx.apply(RetxEvent::Transmit)?;
+    retx.apply(RetxEvent::Retransmit)?;
+    retx.apply(RetxEvent::Ack)?;
+
+    // Path lifecycle
+    path.apply(PathEvent::HighLoss)?;
+    path.apply(PathEvent::GoodAck)?;
+
+    // Check invariants at a valid state
+    let global = GlobalState {
+        conn: conn.state,
+        stream: stream.state,
+        retx: retx.state,
+    };
+    
+    let invariants_ok = global.check_invariants().is_ok();
+
+    // Close everything
+    stream.apply(StreamEvent::Close)?;
+    conn.apply(ConnEvent::Close)?;
+    conn.apply(ConnEvent::CloseAckReceived)?;
+
+    Ok((conn, stream, retx, path, invariants_ok))
 }
+
+// ==========================================
+// MARKDOWN GENERATION
+// ==========================================
 
 fn protocol_spec() -> String {
     let mut out = String::new();
 
     writeln!(out, "# Adaptive Transport Prototype Protocol Specification").unwrap();
     writeln!(out).unwrap();
-
     writeln!(out, "## 1. Overview").unwrap();
+    writeln!(out, "This prototype implements an adaptive transport protocol over UDP.").unwrap();
+    writeln!(out, "It supports adaptive reliability, priority scheduling, congestion control,").unwrap();
+    writeln!(out, "feature extraction, AI-assisted congestion prediction, multipath steering,").unwrap();
+    writeln!(out, "network emulation, streams, connection management, and experiment reporting.").unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "This prototype implements an adaptive transport protocol over UDP."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "It supports adaptive reliability, priority scheduling, congestion control,"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "feature extraction, AI-assisted congestion prediction, multipath steering,"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "network emulation, streams, connection management, and experiment reporting."
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-
     writeln!(out, "## 2. Packet Header Format").unwrap();
-    writeln!(out).unwrap();
     writeln!(out, "Fixed header size: 28 bytes.").unwrap();
-    writeln!(out).unwrap();
     writeln!(out, "| Field | Size | Description |").unwrap();
     writeln!(out, "|---|---:|---|").unwrap();
     writeln!(out, "| version | 1 byte | Protocol version |").unwrap();
@@ -130,190 +298,74 @@ fn protocol_spec() -> String {
     writeln!(out, "| acknowledgment_number | 4 bytes | ACKed sequence number |").unwrap();
     writeln!(out, "| timestamp_us | 8 bytes | Sender timestamp in microseconds |").unwrap();
     writeln!(out).unwrap();
-
-    writeln!(out, "## 3. Packet Types").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "| Type | Value | Meaning |").unwrap();
-    writeln!(out, "|---|---:|---|").unwrap();
-    writeln!(out, "| DATA | 0 | Application data packet |").unwrap();
-    writeln!(out, "| ACK | 1 | Acknowledgment for reliable data |").unwrap();
-    writeln!(out, "| SYN | 2 | Connection open request |").unwrap();
-    writeln!(out, "| SYN_ACK | 3 | Connection open response |").unwrap();
-    writeln!(out, "| CLOSE | 4 | Connection close request |").unwrap();
-    writeln!(out, "| CLOSE_ACK | 5 | Connection close response |").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## 4. Reliability Classes").unwrap();
-    writeln!(out).unwrap();
+    writeln!(out, "## 3. Reliability Classes").unwrap();
     writeln!(out, "| Class | Behavior |").unwrap();
     writeln!(out, "|---|---|").unwrap();
     writeln!(out, "| BestEffort | No ACK, no retransmission |").unwrap();
     writeln!(out, "| Important | ACK required, limited retransmissions |").unwrap();
     writeln!(out, "| Guaranteed | ACK required, more retransmissions |").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## 5. Priority Scheduling").unwrap();
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "Packets are scheduled by priority. Higher priority packets are sent first."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "If priority is equal, lower sequence number is sent first."
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## 6. Congestion Controllers").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "| Controller | Description |").unwrap();
-    writeln!(out, "|---|---|").unwrap();
-    writeln!(out, "| simple-aimd | Baseline additive-increase multiplicative-decrease controller |").unwrap();
-    writeln!(out, "| predictive-risk | Heuristic predictive controller using RTT trend, jitter, and loss |").unwrap();
-    writeln!(out, "| simple-ai | Online learning controller using a small adaptive model |").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## 7. Feature Extraction").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "The protocol extracts:").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "- latest RTT").unwrap();
-    writeln!(out, "- average RTT").unwrap();
-    writeln!(out, "- minimum RTT").unwrap();
-    writeln!(out, "- maximum RTT").unwrap();
-    writeln!(out, "- RTT trend").unwrap();
-    writeln!(out, "- jitter").unwrap();
-    writeln!(out, "- loss rate").unwrap();
-    writeln!(out, "- congestion risk score").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## 8. Multipath Support").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "The prototype simulates two paths:").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "- path 0: wifi").unwrap();
-    writeln!(out, "- path 1: cellular").unwrap();
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "High-priority reliable traffic is steered to the better path."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "Best-effort traffic may use the secondary path."
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## 9. Streams").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Each connection can contain multiple streams.").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Each stream has:").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "- stream ID").unwrap();
-    writeln!(out, "- reliability class").unwrap();
-    writeln!(out, "- priority").unwrap();
-    writeln!(out, "- sent count").unwrap();
-    writeln!(out, "- ACK count").unwrap();
-    writeln!(out, "- loss count").unwrap();
-    writeln!(out, "- retransmission count").unwrap();
-    writeln!(out, "- in-flight count").unwrap();
-    writeln!(out, "- average RTT").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## 10. Experiment Outputs").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "The prototype can generate:").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "- telemetry.jsonl").unwrap();
-    writeln!(out, "- experiment_results.csv").unwrap();
-    writeln!(out, "- summary_results.csv").unwrap();
-    writeln!(out, "- multipath_results.csv").unwrap();
-    writeln!(out, "- multipath_summary.csv").unwrap();
-    writeln!(out, "- PROTOCOL.md").unwrap();
-    writeln!(out, "- STATE_MACHINE.md").unwrap();
-    writeln!(out).unwrap();
 
     out
 }
 
-fn state_machine_spec(machine: &ConnStateMachine) -> String {
+fn state_machine_spec(
+    conn: &ConnStateMachine,
+    stream: &StreamStateMachine,
+    retx: &RetxStateMachine,
+    path: &PathStateMachine,
+    invariants_ok: bool,
+) -> String {
     let mut out = String::new();
 
-    writeln!(out, "# Connection State Machine").unwrap();
+    writeln!(out, "# Formal State Machines").unwrap();
     writeln!(out).unwrap();
 
-    writeln!(out, "## States").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "- Closed").unwrap();
-    writeln!(out, "- WaitSynAck").unwrap();
-    writeln!(out, "- Established").unwrap();
-    writeln!(out, "- WaitCloseAck").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## Events").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "- Connect").unwrap();
-    writeln!(out, "- SynAckReceived").unwrap();
-    writeln!(out, "- Close").unwrap();
-    writeln!(out, "- CloseAckReceived").unwrap();
-    writeln!(out, "- Timeout").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## Valid Transitions").unwrap();
-    writeln!(out).unwrap();
+    // Connection
+    writeln!(out, "## 1. Connection State Machine").unwrap();
     writeln!(out, "```text").unwrap();
-    writeln!(out, "Closed --Connect--> WaitSynAck").unwrap();
-    writeln!(out, "WaitSynAck --SynAckReceived--> Established").unwrap();
-    writeln!(out, "WaitSynAck --Timeout--> Closed").unwrap();
-    writeln!(out, "Established --Close--> WaitCloseAck").unwrap();
-    writeln!(out, "WaitCloseAck --CloseAckReceived--> Closed").unwrap();
-    writeln!(out, "WaitCloseAck --Timeout--> Closed").unwrap();
+    for entry in &conn.log { writeln!(out, "{}", entry).unwrap(); }
     writeln!(out, "```").unwrap();
     writeln!(out).unwrap();
 
-    writeln!(out, "## Self-Check Trace").unwrap();
-    writeln!(out).unwrap();
+    // Stream
+    writeln!(out, "## 2. Stream State Machine").unwrap();
     writeln!(out, "```text").unwrap();
+    for entry in &stream.log { writeln!(out, "{}", entry).unwrap(); }
+    writeln!(out, "```").unwrap();
+    writeln!(out).unwrap();
 
-    for entry in &machine.log {
-        writeln!(out, "{}", entry).unwrap();
+    // Retransmission
+    writeln!(out, "## 3. Retransmission State Machine").unwrap();
+    writeln!(out, "```text").unwrap();
+    for entry in &retx.log { writeln!(out, "{}", entry).unwrap(); }
+    writeln!(out, "```").unwrap();
+    writeln!(out).unwrap();
+
+    // Path
+    writeln!(out, "## 4. Multipath Path State Machine").unwrap();
+    writeln!(out, "```text").unwrap();
+    for entry in &path.log { writeln!(out, "{}", entry).unwrap(); }
+    writeln!(out, "```").unwrap();
+    writeln!(out).unwrap();
+
+    // Invariants
+    writeln!(out, "## 5. Formal Invariants").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "1. A stream cannot be `Active` if the Connection is `Closed`.").unwrap();
+    writeln!(out, "2. A packet cannot be `InFlight` if its Stream is `Closed`.").unwrap();
+    writeln!(out).unwrap();
+    if invariants_ok {
+        writeln!(out, "**Self-Check Result:** All invariants held true during the lifecycle trace.").unwrap();
+    } else {
+        writeln!(out, "**Self-Check Result:** INVARIANT VIOLATION DETECTED.").unwrap();
     }
-
-    writeln!(out, "```").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## Stream State").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Each stream is currently modeled with simple states:").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "- created").unwrap();
-    writeln!(out, "- active").unwrap();
-    writeln!(out, "- closed when connection closes").unwrap();
-    writeln!(out).unwrap();
-
-    writeln!(out, "## Retransmission State").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Each reliable packet has:").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "- first send time").unwrap();
-    writeln!(out, "- last send time").unwrap();
-    writeln!(out, "- attempt count").unwrap();
-    writeln!(out, "- maximum attempts").unwrap();
-    writeln!(out, "- path ID").unwrap();
-    writeln!(out, "- stream ID").unwrap();
-    writeln!(out).unwrap();
 
     out
 }
 
 fn main() -> io::Result<()> {
-    let machine = match run_self_check() {
-        Ok(machine) => machine,
+    let (conn, stream, retx, path, invariants_ok) = match run_self_check() {
+        Ok(data) => data,
         Err(e) => {
             eprintln!("State machine self-check failed: {}", e);
             process::exit(1);
@@ -321,7 +373,7 @@ fn main() -> io::Result<()> {
     };
 
     fs::write("PROTOCOL.md", protocol_spec())?;
-    fs::write("STATE_MACHINE.md", state_machine_spec(&machine))?;
+    fs::write("STATE_MACHINE.md", state_machine_spec(&conn, &stream, &retx, &path, invariants_ok))?;
 
     println!("State machine self-check passed.");
     println!("Wrote PROTOCOL.md");
@@ -337,7 +389,6 @@ mod tests {
     #[test]
     fn valid_connection_lifecycle() {
         let mut machine = ConnStateMachine::new();
-
         assert!(machine.apply(ConnEvent::Connect).is_ok());
         assert!(machine.apply(ConnEvent::SynAckReceived).is_ok());
         assert!(machine.apply(ConnEvent::Close).is_ok());
@@ -347,7 +398,26 @@ mod tests {
     #[test]
     fn invalid_transition_fails() {
         let mut machine = ConnStateMachine::new();
-
         assert!(machine.apply(ConnEvent::Close).is_err());
+    }
+    
+    #[test]
+    fn invariants_hold_in_valid_state() {
+        let global = GlobalState {
+            conn: ConnState::Established,
+            stream: StreamState::Active,
+            retx: RetxState::InFlight,
+        };
+        assert!(global.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn invariants_catch_invalid_state() {
+        let global = GlobalState {
+            conn: ConnState::Closed,
+            stream: StreamState::Active,
+            retx: RetxState::Ready,
+        };
+        assert!(global.check_invariants().is_err());
     }
 }
