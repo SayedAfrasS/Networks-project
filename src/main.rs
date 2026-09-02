@@ -2,6 +2,7 @@
 
 mod ai;
 mod congestion;
+mod connection;
 mod emulator;
 mod experiment;
 mod features;
@@ -13,7 +14,7 @@ mod report;
 mod scheduler;
 mod telemetry;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::net::{SocketAddr, UdpSocket};
@@ -21,12 +22,16 @@ use std::time::{Duration, Instant};
 
 use ai::AiCongestionController;
 use congestion::{CongestionController, PredictiveController, SimpleAimd};
+use connection::{ConnectionManager, ConnectionState};
 use emulator::{NetworkEmulator, SendOutcome};
 use experiment::{ExperimentLogger, ExperimentResult};
 use metrics::Metrics;
 use mp_report::MultipathExperimentLogger;
 use multipath::MultipathManager;
-use packet::{decode_packet, encode_packet, Packet, Reliability, TYPE_ACK, TYPE_DATA};
+use packet::{
+    decode_packet, encode_packet, now_us, Packet, Reliability, TYPE_ACK, TYPE_CLOSE,
+    TYPE_CLOSE_ACK, TYPE_DATA, TYPE_SYN, TYPE_SYN_ACK,
+};
 use scheduler::{PriorityScheduler, ScheduledPacket};
 use telemetry::TelemetryLogger;
 
@@ -44,6 +49,10 @@ fn parse_ms(value: &str) -> u64 {
     value.parse::<u64>().unwrap_or(0).min(10_000)
 }
 
+fn generate_connection_id() -> u32 {
+    (now_us() & 0xFFFF_FFFF) as u32
+}
+
 fn send_ack(socket: &UdpSocket, destination: SocketAddr, packet: &Packet) -> io::Result<usize> {
     let ack_packet = encode_packet(
         TYPE_ACK,
@@ -57,6 +66,90 @@ fn send_ack(socket: &UdpSocket, destination: SocketAddr, packet: &Packet) -> io:
     );
 
     socket.send_to(&ack_packet, destination)
+}
+
+fn send_control(
+    socket: &UdpSocket,
+    destination: SocketAddr,
+    ptype: u8,
+    connection_id: u32,
+    ack: u32,
+) -> io::Result<usize> {
+    let control_packet = encode_packet(
+        ptype,
+        Reliability::BestEffort,
+        0,
+        connection_id,
+        0,
+        0,
+        ack,
+        &[],
+    );
+
+    socket.send_to(&control_packet, destination)
+}
+
+fn send_control_to_server(
+    socket: &UdpSocket,
+    ptype: u8,
+    connection_id: u32,
+    seq: u32,
+) -> io::Result<()> {
+    let control_packet = encode_packet(
+        ptype,
+        Reliability::BestEffort,
+        0,
+        connection_id,
+        0,
+        seq,
+        0,
+        &[],
+    );
+
+    socket.send(&control_packet)?;
+
+    Ok(())
+}
+
+fn wait_for_control(
+    socket: &UdpSocket,
+    expected_type: u8,
+    expected_connection_id: u32,
+    timeout: Duration,
+) -> io::Result<bool> {
+    let mut buffer = [0u8; 65535];
+
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let now = Instant::now();
+
+        if now >= deadline {
+            return Ok(false);
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        socket.set_read_timeout(Some(remaining))?;
+
+        match socket.recv_from(&mut buffer) {
+            Ok((n, _addr)) => {
+                if let Ok(packet) = decode_packet(&buffer[..n]) {
+                    if packet.ptype == expected_type
+                        && packet.connection_id == expected_connection_id
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn enqueue_demo_batch(
@@ -88,8 +181,9 @@ fn enqueue_demo_batch(
         );
 
         println!(
-            "Enqueued seq={} prio={} rel={:?} payload={:?}",
+            "Enqueued seq={} stream={} prio={} rel={:?} payload={:?}",
             *seq,
+            stream_id,
             priority,
             reliability,
             message
@@ -471,13 +565,75 @@ fn run_server(bind_address: &str) -> io::Result<()> {
 
     let mut buffer = [0u8; 65535];
 
+    let mut known_connections: HashSet<(SocketAddr, u32)> = HashSet::new();
+    let mut known_streams: HashSet<(SocketAddr, u32, u32)> = HashSet::new();
+
     loop {
         let (n, source) = socket.recv_from(&mut buffer)?;
 
         match decode_packet(&buffer[..n]) {
             Ok(packet) => {
                 match packet.ptype {
+                    TYPE_SYN => {
+                        known_connections.insert((source, packet.connection_id));
+
+                        println!(
+                            "[SYN] conn={} from={}",
+                            packet.connection_id,
+                            source
+                        );
+
+                        send_control(
+                            &socket,
+                            source,
+                            TYPE_SYN_ACK,
+                            packet.connection_id,
+                            packet.seq,
+                        )?;
+                    }
+                    TYPE_CLOSE => {
+                        known_connections.remove(&(source, packet.connection_id));
+
+                        known_streams.retain(|key| {
+                            !(key.0 == source && key.1 == packet.connection_id)
+                        });
+
+                        println!(
+                            "[CLOSE] conn={} from={}",
+                            packet.connection_id,
+                            source
+                        );
+
+                        send_control(
+                            &socket,
+                            source,
+                            TYPE_CLOSE_ACK,
+                            packet.connection_id,
+                            packet.seq,
+                        )?;
+                    }
                     TYPE_DATA => {
+                        if known_connections.insert((source, packet.connection_id)) {
+                            println!(
+                                "[CONN] accepted conn={} from={}",
+                                packet.connection_id,
+                                source
+                            );
+                        }
+
+                        if known_streams.insert((
+                            source,
+                            packet.connection_id,
+                            packet.stream_id,
+                        )) {
+                            println!(
+                                "[STREAM] opened conn={} stream={} from={}",
+                                packet.connection_id,
+                                packet.stream_id,
+                                source
+                            );
+                        }
+
                         let text = String::from_utf8_lossy(&packet.payload);
 
                         println!(
@@ -495,6 +651,22 @@ fn run_server(bind_address: &str) -> io::Result<()> {
                         if packet.reliability != Reliability::BestEffort {
                             send_ack(&socket, source, &packet)?;
                         }
+                    }
+                    TYPE_SYN_ACK => {
+                        println!(
+                            "[SYN-ACK] conn={} stream={} ack={}",
+                            packet.connection_id,
+                            packet.stream_id,
+                            packet.ack
+                        );
+                    }
+                    TYPE_CLOSE_ACK => {
+                        println!(
+                            "[CLOSE-ACK] conn={} stream={} ack={}",
+                            packet.connection_id,
+                            packet.stream_id,
+                            packet.ack
+                        );
                     }
                     TYPE_ACK => {
                         println!(
@@ -530,15 +702,27 @@ fn run_client(server_address: &str) -> io::Result<()> {
     let mut emulator = NetworkEmulator::new();
     let mut multipath = MultipathManager::new();
 
+    let mut connection = ConnectionManager::new(generate_connection_id());
+    let mut control_seq: u32 = 1;
+
     println!("Client ready. Sending to {}", server_address);
     println!("Congestion controller: {}", controller.name());
     println!("Controller status: {}", controller.status());
+    println!("Connection: {}", connection.status());
     println!("Emulator: {}", emulator.status());
     println!("Multipath: {}", multipath.status());
     println!();
     println!("Normal format: <reliability> <priority> <message>");
     println!("Reliability values: be | important | guaranteed");
     println!("Extra commands:");
+    println!("  connect     Open connection");
+    println!("  close       Close connection");
+    println!("  mkstream <reliability> <priority>");
+    println!("              Create new stream");
+    println!("  use <id>    Select stream");
+    println!("  streams     List streams");
+    println!("  send <message>");
+    println!("              Send using current stream defaults");
     println!("  stats       Show metrics and features");
     println!("  features    Show feature extraction details");
     println!("  batch       Send demo packets");
@@ -565,10 +749,11 @@ fn run_client(server_address: &str) -> io::Result<()> {
     let _ = telemetry.log(
         "client_start",
         &format!(
-            "server={} controller={} {} emulator={} multipath={}",
+            "server={} controller={} {} connection={} emulator={} multipath={}",
             server_address,
             controller.name(),
             controller.status(),
+            connection.status(),
             emulator.status(),
             multipath.status()
         ),
@@ -577,9 +762,6 @@ fn run_client(server_address: &str) -> io::Result<()> {
     let stdin = io::stdin();
 
     let mut seq: u32 = 1;
-
-    let connection_id: u32 = 0x00AB_1234;
-    let stream_id: u32 = 1;
 
     loop {
         print!("> ");
@@ -612,6 +794,14 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("Reliability values: be | important | guaranteed");
                 println!();
                 println!("Commands:");
+                println!("  connect     Open connection");
+                println!("  close       Close connection");
+                println!("  mkstream <reliability> <priority>");
+                println!("              Create new stream");
+                println!("  use <id>    Select stream");
+                println!("  streams     List streams");
+                println!("  send <message>");
+                println!("              Send using current stream defaults");
                 println!("  stats       Show metrics and features");
                 println!("  features    Show feature extraction details");
                 println!("  batch       Send demo packets");
@@ -635,13 +825,260 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("  exit        Quit client");
                 continue;
             }
+            "connect" => {
+                if connection.state == ConnectionState::Connected {
+                    println!("Already connected.");
+                    println!("Use close first if you want to reconnect.");
+                    continue;
+                }
+
+                connection.connection_id = generate_connection_id();
+                connection.state = ConnectionState::Connecting;
+
+                let syn_seq = control_seq;
+                control_seq = control_seq.wrapping_add(1);
+
+                println!("Sending SYN conn={}", connection.connection_id);
+
+                send_control_to_server(
+                    &socket,
+                    TYPE_SYN,
+                    connection.connection_id,
+                    syn_seq,
+                )?;
+
+                match wait_for_control(
+                    &socket,
+                    TYPE_SYN_ACK,
+                    connection.connection_id,
+                    Duration::from_millis(800),
+                ) {
+                    Ok(true) => {
+                        connection.state = ConnectionState::Connected;
+
+                        println!("Connected: {}", connection.status());
+
+                        let _ = telemetry.log(
+                            "connection_established",
+                            &connection.status(),
+                        );
+                    }
+                    Ok(false) => {
+                        connection.state = ConnectionState::Disconnected;
+
+                        println!("Connection failed: timeout waiting for SYN-ACK");
+
+                        let _ = telemetry.log(
+                            "connection_failed",
+                            &connection.status(),
+                        );
+                    }
+                    Err(e) => {
+                        connection.state = ConnectionState::Disconnected;
+
+                        eprintln!("Connection error: {}", e);
+                    }
+                }
+
+                continue;
+            }
+            "close" => {
+                if connection.state != ConnectionState::Connected {
+                    println!("Not connected.");
+                    continue;
+                }
+
+                connection.state = ConnectionState::Closing;
+
+                let close_seq = control_seq;
+                control_seq = control_seq.wrapping_add(1);
+
+                println!("Sending CLOSE conn={}", connection.connection_id);
+
+                send_control_to_server(
+                    &socket,
+                    TYPE_CLOSE,
+                    connection.connection_id,
+                    close_seq,
+                )?;
+
+                match wait_for_control(
+                    &socket,
+                    TYPE_CLOSE_ACK,
+                    connection.connection_id,
+                    Duration::from_millis(800),
+                ) {
+                    Ok(true) => {
+                        connection.state = ConnectionState::Disconnected;
+
+                        println!("Connection closed: {}", connection.status());
+
+                        let _ = telemetry.log(
+                            "connection_closed",
+                            &connection.status(),
+                        );
+                    }
+                    Ok(false) => {
+                        connection.state = ConnectionState::Disconnected;
+
+                        println!("Close completed locally, but no CLOSE-ACK received.");
+
+                        let _ = telemetry.log(
+                            "connection_close_timeout",
+                            &connection.status(),
+                        );
+                    }
+                    Err(e) => {
+                        connection.state = ConnectionState::Disconnected;
+
+                        eprintln!("Close error: {}", e);
+                    }
+                }
+
+                continue;
+            }
+            "mkstream" => {
+                if connection.state != ConnectionState::Connected {
+                    println!("Connect first.");
+                    continue;
+                }
+
+                let reliability_str = line.split_whitespace().nth(1).unwrap_or("guaranteed");
+
+                let priority_str = line.split_whitespace().nth(2).unwrap_or("0");
+
+                let reliability = Reliability::parse(reliability_str)
+                    .unwrap_or(Reliability::Guaranteed);
+
+                let priority = priority_str.parse::<u8>().unwrap_or(0);
+
+                let stream_id = connection.create_stream(reliability, priority);
+
+                println!(
+                    "Created stream {} rel={:?} prio={}",
+                    stream_id,
+                    reliability,
+                    priority
+                );
+
+                let _ = telemetry.log(
+                    "stream_created",
+                    &format!(
+                        "stream={} rel={:?} prio={}",
+                        stream_id,
+                        reliability,
+                        priority
+                    ),
+                );
+
+                continue;
+            }
+            "use" => {
+                let stream_id = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .parse::<u32>()
+                    .unwrap_or(0);
+
+                if connection.use_stream(stream_id) {
+                    println!("Current stream is now {}", stream_id);
+
+                    let _ = telemetry.log(
+                        "stream_selected",
+                        &format!("stream={}", stream_id),
+                    );
+                } else {
+                    println!("Stream {} not found.", stream_id);
+                }
+
+                continue;
+            }
+            "streams" => {
+                println!("Connection: {}", connection.status());
+
+                for stream_id in connection.stream_ids() {
+                    if let Some(stream) = connection.streams.get(&stream_id) {
+                        println!(
+                            "stream={} rel={:?} prio={}",
+                            stream.id,
+                            stream.reliability,
+                            stream.priority
+                        );
+                    }
+                }
+
+                continue;
+            }
+            "send" => {
+                if connection.state != ConnectionState::Connected {
+                    println!("Connect first.");
+                    continue;
+                }
+
+                let message = line
+                    .splitn(2, ' ')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .trim();
+
+                if message.is_empty() {
+                    println!("Usage: send <message>");
+                    continue;
+                }
+
+                let stream = match connection.streams.get(&connection.current_stream) {
+                    Some(stream) => *stream,
+                    None => {
+                        println!("Current stream not found.");
+                        continue;
+                    }
+                };
+
+                let payload = message.as_bytes();
+
+                let packet = encode_packet(
+                    TYPE_DATA,
+                    stream.reliability,
+                    stream.priority,
+                    connection.connection_id,
+                    stream.id,
+                    seq,
+                    0,
+                    payload,
+                );
+
+                scheduler.enqueue(ScheduledPacket {
+                    priority: stream.priority,
+                    seq,
+                    reliability: stream.reliability,
+                    encoded: packet,
+                    payload_preview: message.to_string(),
+                });
+
+                seq = seq.wrapping_add(1);
+
+                send_scheduled_packets(
+                    &socket,
+                    &mut scheduler,
+                    &mut *controller,
+                    &mut telemetry,
+                    &mut metrics,
+                    &mut emulator,
+                    &mut multipath,
+                )?;
+
+                continue;
+            }
             "stats" => {
                 let controller_status = controller.status();
                 let features_text = controller.features_text();
                 let summary = metrics.summary();
                 let emulator_status = emulator.status();
                 let multipath_status = multipath.status();
+                let connection_status = connection.status();
 
+                println!("Connection: {}", connection_status);
                 println!("Controller status: {}", controller_status);
                 println!("Features: {}", features_text);
                 println!("Emulator: {}", emulator_status);
@@ -651,7 +1088,8 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 let _ = telemetry.log(
                     "stats",
                     &format!(
-                        "{} {} {} {} {}",
+                        "{} {} {} {} {} {}",
+                        connection_status,
                         controller_status,
                         features_text,
                         emulator_status,
@@ -915,6 +1353,11 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 continue;
             }
             "experiment" | "exp" => {
+                if connection.state != ConnectionState::Connected {
+                    println!("Connect first.");
+                    continue;
+                }
+
                 let runs = line
                     .split_whitespace()
                     .nth(1)
@@ -969,8 +1412,8 @@ fn run_client(server_address: &str) -> io::Result<()> {
                     enqueue_demo_batch(
                         &mut scheduler,
                         &mut seq,
-                        connection_id,
-                        stream_id,
+                        connection.connection_id,
+                        connection.current_stream,
                     );
 
                     if let Err(e) = send_scheduled_packets(
@@ -1064,11 +1507,16 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 continue;
             }
             "batch" | "demo" => {
+                if connection.state != ConnectionState::Connected {
+                    println!("Connect first.");
+                    continue;
+                }
+
                 enqueue_demo_batch(
                     &mut scheduler,
                     &mut seq,
-                    connection_id,
-                    stream_id,
+                    connection.connection_id,
+                    connection.current_stream,
                 );
 
                 let _ = telemetry.log(
@@ -1091,6 +1539,11 @@ fn run_client(server_address: &str) -> io::Result<()> {
             _ => {}
         }
 
+        if connection.state != ConnectionState::Connected {
+            println!("Connect first.");
+            continue;
+        }
+
         let mut parts = line.split_whitespace();
 
         let reliability_str = parts.next().unwrap_or_default();
@@ -1104,11 +1557,9 @@ fn run_client(server_address: &str) -> io::Result<()> {
             continue;
         }
 
-        let reliability = match reliability_str.to_lowercase().as_str() {
-            "be" | "best" | "besteffort" => Reliability::BestEffort,
-            "important" | "imp" => Reliability::Important,
-            "guaranteed" | "reliable" | "rel" => Reliability::Guaranteed,
-            _ => {
+        let reliability = match Reliability::parse(reliability_str) {
+            Some(reliability) => reliability,
+            None => {
                 println!(
                     "Unknown reliability or command '{}'. Type help.",
                     reliability_str
@@ -1125,8 +1576,8 @@ fn run_client(server_address: &str) -> io::Result<()> {
             TYPE_DATA,
             reliability,
             priority,
-            connection_id,
-            stream_id,
+            connection.connection_id,
+            connection.current_stream,
             seq,
             0,
             &payload,

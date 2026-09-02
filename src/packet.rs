@@ -5,6 +5,12 @@ pub const VERSION: u8 = 1;
 pub const TYPE_DATA: u8 = 0;
 pub const TYPE_ACK: u8 = 1;
 
+pub const TYPE_SYN: u8 = 2;
+pub const TYPE_SYN_ACK: u8 = 3;
+
+pub const TYPE_CLOSE: u8 = 4;
+pub const TYPE_CLOSE_ACK: u8 = 5;
+
 pub const HEADER_LEN: usize = 28;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,6 +34,15 @@ impl Reliability {
             0 => Some(Reliability::BestEffort),
             1 => Some(Reliability::Important),
             2 => Some(Reliability::Guaranteed),
+            _ => None,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_lowercase().as_str() {
+            "be" | "best" | "besteffort" => Some(Reliability::BestEffort),
+            "important" | "imp" => Some(Reliability::Important),
+            "guaranteed" | "reliable" | "rel" => Some(Reliability::Guaranteed),
             _ => None,
         }
     }
