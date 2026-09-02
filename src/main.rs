@@ -6,6 +6,7 @@ mod emulator;
 mod experiment;
 mod features;
 mod metrics;
+mod multipath;
 mod packet;
 mod report;
 mod scheduler;
@@ -22,6 +23,7 @@ use congestion::{CongestionController, PredictiveController, SimpleAimd};
 use emulator::{NetworkEmulator, SendOutcome};
 use experiment::{ExperimentLogger, ExperimentResult};
 use metrics::Metrics;
+use multipath::MultipathManager;
 use packet::{decode_packet, encode_packet, Packet, Reliability, TYPE_ACK, TYPE_DATA};
 use scheduler::{PriorityScheduler, ScheduledPacket};
 use telemetry::TelemetryLogger;
@@ -110,6 +112,8 @@ struct UnackedPacket {
     max_attempts: u32,
     first_send_time: Instant,
     last_send_time: Instant,
+    path_id: u8,
+    timeout: Duration,
 }
 
 fn send_scheduled_packets(
@@ -119,6 +123,7 @@ fn send_scheduled_packets(
     telemetry: &mut TelemetryLogger,
     metrics: &mut Metrics,
     emulator: &mut NetworkEmulator,
+    multipath: &mut MultipathManager,
 ) -> io::Result<()> {
     let mut pending: VecDeque<ScheduledPacket> = VecDeque::new();
 
@@ -128,14 +133,9 @@ fn send_scheduled_packets(
 
     let mut unacked: Vec<UnackedPacket> = Vec::new();
 
-    let base_timeout = Duration::from_millis(
-        400u64.saturating_add(emulator.max_delay_ms().saturating_mul(2)),
-    );
-
     let mut rx_buffer = [0u8; 65535];
 
     while !pending.is_empty() || !unacked.is_empty() {
-        // Send new packets while the congestion controller allows it.
         loop {
             if pending.is_empty() {
                 break;
@@ -154,47 +154,75 @@ fn send_scheduled_packets(
 
             let packet_len = item.encoded.len();
 
+            let path_id = if multipath.enabled {
+                multipath.choose_path(item.reliability, item.priority)
+            } else {
+                0
+            };
+
+            let path_delay = if multipath.enabled {
+                multipath.path_max_delay_ms(path_id)
+            } else {
+                emulator.max_delay_ms()
+            };
+
+            let timeout = Duration::from_millis(
+                400u64.saturating_add(path_delay.saturating_mul(2)),
+            );
+
             metrics.record_send(item.reliability, item.priority);
 
             let _ = telemetry.log(
                 "scheduled_send",
                 &format!(
-                    "seq={} rel={:?} prio={} len={} payload={}",
+                    "seq={} rel={:?} prio={} len={} path={} payload={}",
                     item.seq,
                     item.reliability,
                     item.priority,
                     packet_len,
+                    path_id,
                     item.payload_preview
                 ),
             );
 
             println!(
-                "[SEND] seq={} prio={} rel={:?} payload={:?}",
+                "[SEND] seq={} prio={} rel={:?} path={} payload={:?}",
                 item.seq,
                 item.priority,
                 item.reliability,
+                path_id,
                 item.payload_preview
             );
 
             if item.reliability == Reliability::BestEffort {
-                let outcome = emulator.send_packet(socket, &item.encoded)?;
+                let outcome = if multipath.enabled {
+                    multipath.send_packet(path_id, socket, &item.encoded)?
+                } else {
+                    emulator.send_packet(socket, &item.encoded)?
+                };
 
                 match outcome {
                     SendOutcome::Sent => {
                         println!(
-                            "Sent best-effort seq={}; no ACK expected",
-                            item.seq
+                            "Sent best-effort seq={} path={}; no ACK expected",
+                            item.seq,
+                            path_id
                         );
                     }
                     SendOutcome::Dropped => {
                         println!(
-                            "[EMULATOR] dropped best-effort seq={}",
-                            item.seq
+                            "[EMULATOR] dropped best-effort seq={} path={}",
+                            item.seq,
+                            path_id
                         );
 
                         let _ = telemetry.log(
                             "emulator_drop",
-                            &format!("seq={} rel=BestEffort", item.seq),
+                            &format!(
+                                "seq={} rel=BestEffort path={}",
+                                item.seq,
+                                path_id
+                            ),
                         );
                     }
                 }
@@ -206,17 +234,22 @@ fn send_scheduled_packets(
 
             let now = Instant::now();
 
-            let outcome = emulator.send_packet(socket, &item.encoded)?;
+            let outcome = if multipath.enabled {
+                multipath.send_packet(path_id, socket, &item.encoded)?
+            } else {
+                emulator.send_packet(socket, &item.encoded)?
+            };
 
             if outcome == SendOutcome::Dropped {
                 println!(
-                    "[EMULATOR] dropped seq={} on attempt 1",
-                    item.seq
+                    "[EMULATOR] dropped seq={} path={} on attempt 1",
+                    item.seq,
+                    path_id
                 );
 
                 let _ = telemetry.log(
                     "emulator_drop",
-                    &format!("seq={} attempt=1", item.seq),
+                    &format!("seq={} attempt=1 path={}", item.seq, path_id),
                 );
             }
 
@@ -233,6 +266,8 @@ fn send_scheduled_packets(
                 max_attempts,
                 first_send_time: now,
                 last_send_time: now,
+                path_id,
+                timeout,
             });
         }
 
@@ -244,7 +279,6 @@ fn send_scheduled_packets(
             continue;
         }
 
-        // Wait briefly for ACKs.
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
 
         match socket.recv_from(&mut rx_buffer) {
@@ -260,14 +294,19 @@ fn send_scheduled_packets(
 
                             let elapsed = acked.first_send_time.elapsed();
 
+                            if multipath.enabled {
+                                multipath.on_ack(acked.path_id, elapsed);
+                            }
+
                             controller.on_ack(acked.packet_len, elapsed);
                             metrics.record_ack(elapsed);
 
                             let _ = telemetry.log(
                                 "ack",
                                 &format!(
-                                    "seq={} rtt_us={} attempts={} {}",
+                                    "seq={} path={} rtt_us={} attempts={} {}",
                                     acked.item.seq,
+                                    acked.path_id,
                                     elapsed.as_micros(),
                                     acked.attempts,
                                     controller.status()
@@ -275,8 +314,9 @@ fn send_scheduled_packets(
                             );
 
                             println!(
-                                "ACK received seq={}, rtt={:?}, attempts={}, {}",
+                                "ACK received seq={}, path={}, rtt={:?}, attempts={}, {}",
                                 acked.item.seq,
+                                acked.path_id,
                                 elapsed,
                                 acked.attempts,
                                 controller.status()
@@ -294,14 +334,13 @@ fn send_scheduled_packets(
             Err(e) => return Err(e),
         }
 
-        // Check for timeouts and retransmissions.
         let now = Instant::now();
 
         let mut i = 0;
 
         while i < unacked.len() {
             let timed_out =
-                now.duration_since(unacked[i].last_send_time) >= base_timeout;
+                now.duration_since(unacked[i].last_send_time) >= unacked[i].timeout;
 
             if !timed_out {
                 i += 1;
@@ -311,22 +350,28 @@ fn send_scheduled_packets(
             if unacked[i].attempts >= unacked[i].max_attempts {
                 let failed = unacked.remove(i);
 
+                if multipath.enabled {
+                    multipath.on_loss(failed.path_id);
+                }
+
                 controller.on_loss(failed.packet_len);
                 metrics.record_loss();
 
                 let _ = telemetry.log(
                     "loss",
                     &format!(
-                        "seq={} attempts={} {}",
+                        "seq={} path={} attempts={} {}",
                         failed.item.seq,
+                        failed.path_id,
                         failed.attempts,
                         controller.status()
                     ),
                 );
 
                 println!(
-                    "Delivery failed seq={} after {} attempts, {}",
+                    "Delivery failed seq={} path={} after {} attempts, {}",
                     failed.item.seq,
+                    failed.path_id,
                     failed.attempts,
                     controller.status()
                 );
@@ -336,40 +381,73 @@ fn send_scheduled_packets(
 
             unacked[i].attempts += 1;
 
+            let new_path_id = if multipath.enabled {
+                multipath.choose_path(
+                    unacked[i].item.reliability,
+                    unacked[i].item.priority,
+                )
+            } else {
+                unacked[i].path_id
+            };
+
+            let path_delay = if multipath.enabled {
+                multipath.path_max_delay_ms(new_path_id)
+            } else {
+                emulator.max_delay_ms()
+            };
+
+            unacked[i].timeout = Duration::from_millis(
+                400u64.saturating_add(path_delay.saturating_mul(2)),
+            );
+
+            unacked[i].path_id = new_path_id;
+
             metrics.record_retransmit();
             controller.on_retransmit();
 
+            if multipath.enabled {
+                multipath.on_retransmit(new_path_id);
+            }
+
             println!(
-                "Timeout for seq={}; retransmit attempt {}/{}",
+                "Timeout for seq={}; retransmit attempt {}/{} path={}",
                 unacked[i].item.seq,
                 unacked[i].attempts,
-                unacked[i].max_attempts
+                unacked[i].max_attempts,
+                new_path_id
             );
 
             let _ = telemetry.log(
                 "retransmit",
                 &format!(
-                    "seq={} attempt={}/{}",
+                    "seq={} path={} attempt={}/{}",
                     unacked[i].item.seq,
+                    new_path_id,
                     unacked[i].attempts,
                     unacked[i].max_attempts
                 ),
             );
 
-            let outcome = emulator.send_packet(socket, &unacked[i].item.encoded)?;
+            let outcome = if multipath.enabled {
+                multipath.send_packet(new_path_id, socket, &unacked[i].item.encoded)?
+            } else {
+                emulator.send_packet(socket, &unacked[i].item.encoded)?
+            };
 
             if outcome == SendOutcome::Dropped {
                 println!(
-                    "[EMULATOR] dropped seq={} on attempt {}",
+                    "[EMULATOR] dropped seq={} path={} on attempt {}",
                     unacked[i].item.seq,
+                    new_path_id,
                     unacked[i].attempts
                 );
 
                 let _ = telemetry.log(
                     "emulator_drop",
                     &format!(
-                        "seq={} attempt={}",
+                        "seq={} path={} attempt={}",
                         unacked[i].item.seq,
+                        new_path_id,
                         unacked[i].attempts
                     ),
                 );
@@ -448,11 +526,13 @@ fn run_client(server_address: &str) -> io::Result<()> {
     let mut scheduler = PriorityScheduler::new();
     let mut metrics = Metrics::new();
     let mut emulator = NetworkEmulator::new();
+    let mut multipath = MultipathManager::new();
 
     println!("Client ready. Sending to {}", server_address);
     println!("Congestion controller: {}", controller.name());
     println!("Controller status: {}", controller.status());
     println!("Emulator: {}", emulator.status());
+    println!("Multipath: {}", multipath.status());
     println!();
     println!("Normal format: <reliability> <priority> <message>");
     println!("Reliability values: be | important | guaranteed");
@@ -472,6 +552,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
     println!("  delay <ms>  Set delay in ms");
     println!("  jitter <ms> Set jitter in ms");
     println!("  scenario <good|lossy|bad>");
+    println!("  multipath on|off|good|lossy|mixed|bad");
     println!("  emulation   Show emulator settings");
     println!("  clear       Clear emulator settings");
     println!("  help        Show help");
@@ -481,11 +562,12 @@ fn run_client(server_address: &str) -> io::Result<()> {
     let _ = telemetry.log(
         "client_start",
         &format!(
-            "server={} controller={} {} emulator={}",
+            "server={} controller={} {} emulator={} multipath={}",
             server_address,
             controller.name(),
             controller.status(),
-            emulator.status()
+            emulator.status(),
+            multipath.status()
         ),
     );
 
@@ -542,6 +624,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("  delay <ms>  Set delay in ms");
                 println!("  jitter <ms> Set jitter in ms");
                 println!("  scenario <good|lossy|bad>");
+                println!("  multipath on|off|good|lossy|mixed|bad");
                 println!("  emulation   Show emulator settings");
                 println!("  clear       Clear emulator settings");
                 println!("  help        Show this help");
@@ -553,19 +636,22 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 let features_text = controller.features_text();
                 let summary = metrics.summary();
                 let emulator_status = emulator.status();
+                let multipath_status = multipath.status();
 
                 println!("Controller status: {}", controller_status);
                 println!("Features: {}", features_text);
                 println!("Emulator: {}", emulator_status);
+                println!("Multipath: {}", multipath_status);
                 println!("Metrics summary: {}", summary);
 
                 let _ = telemetry.log(
                     "stats",
                     &format!(
-                        "{} {} {} {}",
+                        "{} {} {} {} {}",
                         controller_status,
                         features_text,
                         emulator_status,
+                        multipath_status,
                         summary
                     ),
                 );
@@ -729,6 +815,55 @@ fn run_client(server_address: &str) -> io::Result<()> {
 
                 continue;
             }
+            "multipath" | "mp" => {
+                let argument = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_lowercase();
+
+                match argument.as_str() {
+                    "" => {
+                        println!("Multipath: {}", multipath.status());
+                    }
+                    "on" => {
+                        multipath.enabled = true;
+
+                        println!("Multipath enabled");
+
+                        let _ = telemetry.log(
+                            "multipath_enabled",
+                            &multipath.status(),
+                        );
+                    }
+                    "off" => {
+                        multipath.enabled = false;
+
+                        println!("Multipath disabled");
+
+                        let _ = telemetry.log(
+                            "multipath_disabled",
+                            &multipath.status(),
+                        );
+                    }
+                    "good" | "lossy" | "mixed" | "bad" => {
+                        multipath.set_scenario(&argument);
+
+                        println!("Multipath scenario: {}", multipath.status());
+
+                        let _ = telemetry.log(
+                            "multipath_scenario",
+                            &format!("scenario={} {}", argument, multipath.status()),
+                        );
+                    }
+                    _ => {
+                        println!("Unknown multipath command.");
+                        println!("Use: multipath on|off|good|lossy|mixed|bad");
+                    }
+                }
+
+                continue;
+            }
             "emulation" | "emu" => {
                 println!("Emulator: {}", emulator.status());
 
@@ -754,11 +889,17 @@ fn run_client(server_address: &str) -> io::Result<()> {
                     .unwrap_or(5)
                     .clamp(1, 100);
 
+                let emulator_description = if multipath.enabled {
+                    format!("{} multipath=on", emulator.status())
+                } else {
+                    emulator.status()
+                };
+
                 println!(
                     "Starting experiment: runs={} controller={} emulator={}",
                     runs,
                     controller.name(),
-                    emulator.status()
+                    emulator_description
                 );
 
                 let mut logger = match ExperimentLogger::new("experiment_results.csv") {
@@ -789,6 +930,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                         &mut telemetry,
                         &mut metrics,
                         &mut emulator,
+                        &mut multipath,
                     ) {
                         eprintln!("Experiment run failed: {}", e);
                         break;
@@ -802,12 +944,18 @@ fn run_client(server_address: &str) -> io::Result<()> {
                         metrics.rtt_sum_us / metrics.rtt_samples as u128
                     };
 
+                    let emulator_description = if multipath.enabled {
+                        format!("{} multipath=on", emulator.status())
+                    } else {
+                        emulator.status()
+                    };
+
                     let result = ExperimentResult {
                         timestamp_us: experiment::timestamp_us(),
                         run_id,
 
                         controller: controller.name().to_string(),
-                        emulator: emulator.status(),
+                        emulator: emulator_description,
 
                         sent_total: metrics.sent_total,
                         sent_best_effort: metrics.sent_best_effort,
@@ -868,6 +1016,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                     &mut telemetry,
                     &mut metrics,
                     &mut emulator,
+                    &mut multipath,
                 )?;
 
                 continue;
@@ -933,6 +1082,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
             &mut telemetry,
             &mut metrics,
             &mut emulator,
+            &mut multipath,
         )?;
     }
 
