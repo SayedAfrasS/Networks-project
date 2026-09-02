@@ -11,6 +11,7 @@ mod report;
 mod scheduler;
 mod telemetry;
 
+use std::collections::VecDeque;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::net::{SocketAddr, UdpSocket};
@@ -52,44 +53,6 @@ fn send_ack(socket: &UdpSocket, destination: SocketAddr, packet: &Packet) -> io:
     );
 
     socket.send_to(&ack_packet, destination)
-}
-
-fn wait_for_ack(
-    socket: &UdpSocket,
-    expected_seq: u32,
-    timeout: Duration,
-) -> io::Result<bool> {
-    let mut buffer = [0u8; 65535];
-
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        let now = Instant::now();
-
-        if now >= deadline {
-            return Ok(false);
-        }
-
-        let remaining = deadline.saturating_duration_since(now);
-        socket.set_read_timeout(Some(remaining))?;
-
-        match socket.recv_from(&mut buffer) {
-            Ok((n, _addr)) => {
-                if let Ok(packet) = decode_packet(&buffer[..n]) {
-                    if packet.ptype == TYPE_ACK && packet.ack == expected_seq {
-                        return Ok(true);
-                    }
-                }
-            }
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                return Ok(false);
-            }
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 fn enqueue_demo_batch(
@@ -140,6 +103,15 @@ fn enqueue_demo_batch(
     }
 }
 
+struct UnackedPacket {
+    item: ScheduledPacket,
+    packet_len: usize,
+    attempts: u32,
+    max_attempts: u32,
+    first_send_time: Instant,
+    last_send_time: Instant,
+}
+
 fn send_scheduled_packets(
     socket: &UdpSocket,
     scheduler: &mut PriorityScheduler,
@@ -148,194 +120,264 @@ fn send_scheduled_packets(
     metrics: &mut Metrics,
     emulator: &mut NetworkEmulator,
 ) -> io::Result<()> {
+    let mut pending: VecDeque<ScheduledPacket> = VecDeque::new();
+
     while let Some(item) = scheduler.pop_next() {
-        let packet_len = item.encoded.len();
+        pending.push_back(item);
+    }
 
-        metrics.record_send(item.reliability, item.priority);
+    let mut unacked: Vec<UnackedPacket> = Vec::new();
 
-        let _ = telemetry.log(
-            "scheduled_send",
-            &format!(
-                "seq={} rel={:?} prio={} len={} payload={}",
+    let base_timeout = Duration::from_millis(
+        400u64.saturating_add(emulator.max_delay_ms().saturating_mul(2)),
+    );
+
+    let mut rx_buffer = [0u8; 65535];
+
+    while !pending.is_empty() || !unacked.is_empty() {
+        // Send new packets while the congestion controller allows it.
+        loop {
+            if pending.is_empty() {
+                break;
+            }
+
+            let (packet_len, reliability) = {
+                let front = pending.front().unwrap();
+                (front.encoded.len(), front.reliability)
+            };
+
+            if reliability != Reliability::BestEffort && !controller.can_send(packet_len) {
+                break;
+            }
+
+            let item = pending.pop_front().unwrap();
+
+            let packet_len = item.encoded.len();
+
+            metrics.record_send(item.reliability, item.priority);
+
+            let _ = telemetry.log(
+                "scheduled_send",
+                &format!(
+                    "seq={} rel={:?} prio={} len={} payload={}",
+                    item.seq,
+                    item.reliability,
+                    item.priority,
+                    packet_len,
+                    item.payload_preview
+                ),
+            );
+
+            println!(
+                "[SEND] seq={} prio={} rel={:?} payload={:?}",
                 item.seq,
-                item.reliability,
                 item.priority,
-                packet_len,
+                item.reliability,
                 item.payload_preview
-            ),
-        );
+            );
 
-        println!(
-            "[SEND] seq={} prio={} rel={:?} payload={:?}",
-            item.seq,
-            item.priority,
-            item.reliability,
-            item.payload_preview
-        );
+            if item.reliability == Reliability::BestEffort {
+                let outcome = emulator.send_packet(socket, &item.encoded)?;
 
-        if item.reliability == Reliability::BestEffort {
+                match outcome {
+                    SendOutcome::Sent => {
+                        println!(
+                            "Sent best-effort seq={}; no ACK expected",
+                            item.seq
+                        );
+                    }
+                    SendOutcome::Dropped => {
+                        println!(
+                            "[EMULATOR] dropped best-effort seq={}",
+                            item.seq
+                        );
+
+                        let _ = telemetry.log(
+                            "emulator_drop",
+                            &format!("seq={} rel=BestEffort", item.seq),
+                        );
+                    }
+                }
+
+                continue;
+            }
+
+            controller.on_packet_sent(packet_len);
+
+            let now = Instant::now();
+
             let outcome = emulator.send_packet(socket, &item.encoded)?;
 
-            match outcome {
-                SendOutcome::Sent => {
-                    println!(
-                        "Sent best-effort seq={}; no ACK expected",
-                        item.seq
-                    );
-                }
-                SendOutcome::Dropped => {
-                    println!(
-                        "[EMULATOR] dropped best-effort seq={}",
-                        item.seq
-                    );
+            if outcome == SendOutcome::Dropped {
+                println!(
+                    "[EMULATOR] dropped seq={} on attempt 1",
+                    item.seq
+                );
 
-                    let _ = telemetry.log(
-                        "emulator_drop",
-                        &format!("seq={} rel=BestEffort", item.seq),
-                    );
-                }
+                let _ = telemetry.log(
+                    "emulator_drop",
+                    &format!("seq={} attempt=1", item.seq),
+                );
+            }
+
+            let max_attempts: u32 = match item.reliability {
+                Reliability::Important => 3,
+                Reliability::Guaranteed => 8,
+                Reliability::BestEffort => 1,
+            };
+
+            unacked.push(UnackedPacket {
+                item,
+                packet_len,
+                attempts: 1,
+                max_attempts,
+                first_send_time: now,
+                last_send_time: now,
+            });
+        }
+
+        if unacked.is_empty() {
+            if !pending.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
             }
 
             continue;
         }
 
-        while !controller.can_send(packet_len) {
-            println!("Waiting for congestion window: {}", controller.status());
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // Wait briefly for ACKs.
+        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
 
-        controller.on_packet_sent(packet_len);
+        match socket.recv_from(&mut rx_buffer) {
+            Ok((n, _addr)) => {
+                if let Ok(packet) = decode_packet(&rx_buffer[..n]) {
+                    if packet.ptype == TYPE_ACK {
+                        let pos = unacked
+                            .iter()
+                            .position(|u| u.item.seq == packet.ack);
 
-        let start_time = Instant::now();
+                        if let Some(pos) = pos {
+                            let acked = unacked.remove(pos);
 
-        let outcome = emulator.send_packet(socket, &item.encoded)?;
+                            let elapsed = acked.first_send_time.elapsed();
 
-        if outcome == SendOutcome::Dropped {
-            println!(
-                "[EMULATOR] dropped seq={} on attempt 1",
-                item.seq
-            );
-
-            let _ = telemetry.log(
-                "emulator_drop",
-                &format!("seq={} attempt=1", item.seq),
-            );
-        }
-
-        let ack_timeout = Duration::from_millis(
-            400u64.saturating_add(emulator.max_delay_ms().saturating_mul(2)),
-        );
-
-        let max_attempts: u32 = match item.reliability {
-            Reliability::Important => 3,
-            Reliability::Guaranteed => 8,
-            Reliability::BestEffort => 1,
-        };
-
-        let mut attempt = 1;
-        let mut acked = false;
-
-        while attempt <= max_attempts {
-            match wait_for_ack(socket, item.seq, ack_timeout) {
-                Ok(true) => {
-                    acked = true;
-                    break;
-                }
-                Ok(false) => {
-                    if attempt < max_attempts {
-                        println!(
-                            "Timeout for seq={}; retransmit attempt {}/{}",
-                            item.seq,
-                            attempt + 1,
-                            max_attempts
-                        );
-
-                        metrics.record_retransmit();
-                        controller.on_retransmit();
-
-                        let _ = telemetry.log(
-                            "retransmit",
-                            &format!(
-                                "seq={} attempt={}/{}",
-                                item.seq,
-                                attempt + 1,
-                                max_attempts
-                            ),
-                        );
-
-                        let outcome = emulator.send_packet(socket, &item.encoded)?;
-
-                        if outcome == SendOutcome::Dropped {
-                            println!(
-                                "[EMULATOR] dropped seq={} on attempt {}",
-                                item.seq,
-                                attempt + 1
-                            );
+                            controller.on_ack(acked.packet_len, elapsed);
+                            metrics.record_ack(elapsed);
 
                             let _ = telemetry.log(
-                                "emulator_drop",
+                                "ack",
                                 &format!(
-                                    "seq={} attempt={}",
-                                    item.seq,
-                                    attempt + 1
+                                    "seq={} rtt_us={} attempts={} {}",
+                                    acked.item.seq,
+                                    elapsed.as_micros(),
+                                    acked.attempts,
+                                    controller.status()
                                 ),
+                            );
+
+                            println!(
+                                "ACK received seq={}, rtt={:?}, attempts={}, {}",
+                                acked.item.seq,
+                                elapsed,
+                                acked.attempts,
+                                controller.status()
                             );
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Receive error: {}", e);
-                    break;
-                }
             }
-
-            attempt += 1;
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                // No ACK arrived during this short polling window.
+            }
+            Err(e) => return Err(e),
         }
 
-        let elapsed = start_time.elapsed();
+        // Check for timeouts and retransmissions.
+        let now = Instant::now();
 
-        if acked {
-            controller.on_ack(packet_len, elapsed);
-            metrics.record_ack(elapsed);
+        let mut i = 0;
+
+        while i < unacked.len() {
+            let timed_out =
+                now.duration_since(unacked[i].last_send_time) >= base_timeout;
+
+            if !timed_out {
+                i += 1;
+                continue;
+            }
+
+            if unacked[i].attempts >= unacked[i].max_attempts {
+                let failed = unacked.remove(i);
+
+                controller.on_loss(failed.packet_len);
+                metrics.record_loss();
+
+                let _ = telemetry.log(
+                    "loss",
+                    &format!(
+                        "seq={} attempts={} {}",
+                        failed.item.seq,
+                        failed.attempts,
+                        controller.status()
+                    ),
+                );
+
+                println!(
+                    "Delivery failed seq={} after {} attempts, {}",
+                    failed.item.seq,
+                    failed.attempts,
+                    controller.status()
+                );
+
+                continue;
+            }
+
+            unacked[i].attempts += 1;
+
+            metrics.record_retransmit();
+            controller.on_retransmit();
+
+            println!(
+                "Timeout for seq={}; retransmit attempt {}/{}",
+                unacked[i].item.seq,
+                unacked[i].attempts,
+                unacked[i].max_attempts
+            );
 
             let _ = telemetry.log(
-                "ack",
+                "retransmit",
                 &format!(
-                    "seq={} rtt_us={} attempts={} {}",
-                    item.seq,
-                    elapsed.as_micros(),
-                    attempt,
-                    controller.status()
+                    "seq={} attempt={}/{}",
+                    unacked[i].item.seq,
+                    unacked[i].attempts,
+                    unacked[i].max_attempts
                 ),
             );
 
-            println!(
-                "ACK received seq={}, rtt={:?}, attempts={}, {}",
-                item.seq,
-                elapsed,
-                attempt,
-                controller.status()
-            );
-        } else {
-            controller.on_loss(packet_len);
-            metrics.record_loss();
+            let outcome = emulator.send_packet(socket, &unacked[i].item.encoded)?;
 
-            let _ = telemetry.log(
-                "loss",
-                &format!(
-                    "seq={} attempts={} {}",
-                    item.seq,
-                    max_attempts,
-                    controller.status()
-                ),
-            );
+            if outcome == SendOutcome::Dropped {
+                println!(
+                    "[EMULATOR] dropped seq={} on attempt {}",
+                    unacked[i].item.seq,
+                    unacked[i].attempts
+                );
 
-            println!(
-                "Delivery failed seq={} after {} attempts, {}",
-                item.seq,
-                max_attempts,
-                controller.status()
-            );
+                let _ = telemetry.log(
+                    "emulator_drop",
+                    &format!(
+                        "seq={} attempt={}",
+                        unacked[i].item.seq,
+                        unacked[i].attempts
+                    ),
+                );
+            }
+
+            unacked[i].last_send_time = Instant::now();
+
+            i += 1;
         }
     }
 
