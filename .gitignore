@@ -4,3 +4,7 @@ experiment_results.csv
 summary_results.csv
 multipath_results.csv
 multipath_summary.csv
+*.png
+stats_report.csv
+graph_data.csv
+*.txt
