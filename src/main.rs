@@ -210,6 +210,7 @@ struct UnackedPacket {
     last_send_time: Instant,
     path_id: u8,
     timeout: Duration,
+    stream_id: u32,
 }
 
 fn send_scheduled_packets(
@@ -220,6 +221,7 @@ fn send_scheduled_packets(
     metrics: &mut Metrics,
     emulator: &mut NetworkEmulator,
     multipath: &mut MultipathManager,
+    connection: &mut ConnectionManager,
 ) -> io::Result<()> {
     let mut pending: VecDeque<ScheduledPacket> = VecDeque::new();
 
@@ -237,13 +239,24 @@ fn send_scheduled_packets(
                 break;
             }
 
-            let (packet_len, reliability) = {
+            let (packet_len, reliability, stream_id) = {
                 let front = pending.front().unwrap();
-                (front.encoded.len(), front.reliability)
+
+                let stream_id = decode_packet(&front.encoded)
+                    .map(|p| p.stream_id)
+                    .unwrap_or(0);
+
+                (front.encoded.len(), front.reliability, stream_id)
             };
 
-            if reliability != Reliability::BestEffort && !controller.can_send(packet_len) {
-                break;
+            if reliability != Reliability::BestEffort {
+                if !connection.can_send_stream(stream_id, reliability) {
+                    break;
+                }
+
+                if !controller.can_send(packet_len) {
+                    break;
+                }
             }
 
             let item = pending.pop_front().unwrap();
@@ -268,11 +281,14 @@ fn send_scheduled_packets(
 
             metrics.record_send(item.reliability, item.priority);
 
+            connection.record_send(stream_id, item.reliability);
+
             let _ = telemetry.log(
                 "scheduled_send",
                 &format!(
-                    "seq={} rel={:?} prio={} len={} path={} payload={}",
+                    "seq={} stream={} rel={:?} prio={} len={} path={} payload={}",
                     item.seq,
+                    stream_id,
                     item.reliability,
                     item.priority,
                     packet_len,
@@ -282,8 +298,9 @@ fn send_scheduled_packets(
             );
 
             println!(
-                "[SEND] seq={} prio={} rel={:?} path={} payload={:?}",
+                "[SEND] seq={} stream={} prio={} rel={:?} path={} payload={:?}",
                 item.seq,
+                stream_id,
                 item.priority,
                 item.reliability,
                 path_id,
@@ -300,23 +317,26 @@ fn send_scheduled_packets(
                 match outcome {
                     SendOutcome::Sent => {
                         println!(
-                            "Sent best-effort seq={} path={}; no ACK expected",
+                            "Sent best-effort seq={} stream={} path={}; no ACK expected",
                             item.seq,
+                            stream_id,
                             path_id
                         );
                     }
                     SendOutcome::Dropped => {
                         println!(
-                            "[EMULATOR] dropped best-effort seq={} path={}",
+                            "[EMULATOR] dropped best-effort seq={} stream={} path={}",
                             item.seq,
+                            stream_id,
                             path_id
                         );
 
                         let _ = telemetry.log(
                             "emulator_drop",
                             &format!(
-                                "seq={} rel=BestEffort path={}",
+                                "seq={} stream={} rel=BestEffort path={}",
                                 item.seq,
+                                stream_id,
                                 path_id
                             ),
                         );
@@ -338,14 +358,20 @@ fn send_scheduled_packets(
 
             if outcome == SendOutcome::Dropped {
                 println!(
-                    "[EMULATOR] dropped seq={} path={} on attempt 1",
+                    "[EMULATOR] dropped seq={} stream={} path={} on attempt 1",
                     item.seq,
+                    stream_id,
                     path_id
                 );
 
                 let _ = telemetry.log(
                     "emulator_drop",
-                    &format!("seq={} attempt=1 path={}", item.seq, path_id),
+                    &format!(
+                        "seq={} stream={} attempt=1 path={}",
+                        item.seq,
+                        stream_id,
+                        path_id
+                    ),
                 );
             }
 
@@ -364,6 +390,7 @@ fn send_scheduled_packets(
                 last_send_time: now,
                 path_id,
                 timeout,
+                stream_id,
             });
         }
 
@@ -394,14 +421,17 @@ fn send_scheduled_packets(
                                 multipath.on_ack(acked.path_id, elapsed);
                             }
 
+                            connection.record_ack(acked.stream_id, elapsed);
+
                             controller.on_ack(acked.packet_len, elapsed);
                             metrics.record_ack(elapsed);
 
                             let _ = telemetry.log(
                                 "ack",
                                 &format!(
-                                    "seq={} path={} rtt_us={} attempts={} {}",
+                                    "seq={} stream={} path={} rtt_us={} attempts={} {}",
                                     acked.item.seq,
+                                    acked.stream_id,
                                     acked.path_id,
                                     elapsed.as_micros(),
                                     acked.attempts,
@@ -410,8 +440,9 @@ fn send_scheduled_packets(
                             );
 
                             println!(
-                                "ACK received seq={}, path={}, rtt={:?}, attempts={}, {}",
+                                "ACK received seq={}, stream={}, path={}, rtt={:?}, attempts={}, {}",
                                 acked.item.seq,
+                                acked.stream_id,
                                 acked.path_id,
                                 elapsed,
                                 acked.attempts,
@@ -450,14 +481,17 @@ fn send_scheduled_packets(
                     multipath.on_loss(failed.path_id);
                 }
 
+                connection.record_loss(failed.stream_id);
+
                 controller.on_loss(failed.packet_len);
                 metrics.record_loss();
 
                 let _ = telemetry.log(
                     "loss",
                     &format!(
-                        "seq={} path={} attempts={} {}",
+                        "seq={} stream={} path={} attempts={} {}",
                         failed.item.seq,
+                        failed.stream_id,
                         failed.path_id,
                         failed.attempts,
                         controller.status()
@@ -465,8 +499,9 @@ fn send_scheduled_packets(
                 );
 
                 println!(
-                    "Delivery failed seq={} path={} after {} attempts, {}",
+                    "Delivery failed seq={} stream={} path={} after {} attempts, {}",
                     failed.item.seq,
+                    failed.stream_id,
                     failed.path_id,
                     failed.attempts,
                     controller.status()
@@ -501,13 +536,16 @@ fn send_scheduled_packets(
             metrics.record_retransmit();
             controller.on_retransmit();
 
+            connection.record_retransmit(unacked[i].stream_id);
+
             if multipath.enabled {
                 multipath.on_retransmit(new_path_id);
             }
 
             println!(
-                "Timeout for seq={}; retransmit attempt {}/{} path={}",
+                "Timeout for seq={}; stream={} retransmit attempt {}/{} path={}",
                 unacked[i].item.seq,
+                unacked[i].stream_id,
                 unacked[i].attempts,
                 unacked[i].max_attempts,
                 new_path_id
@@ -516,8 +554,9 @@ fn send_scheduled_packets(
             let _ = telemetry.log(
                 "retransmit",
                 &format!(
-                    "seq={} path={} attempt={}/{}",
+                    "seq={} stream={} path={} attempt={}/{}",
                     unacked[i].item.seq,
+                    unacked[i].stream_id,
                     new_path_id,
                     unacked[i].attempts,
                     unacked[i].max_attempts
@@ -532,8 +571,9 @@ fn send_scheduled_packets(
 
             if outcome == SendOutcome::Dropped {
                 println!(
-                    "[EMULATOR] dropped seq={} path={} on attempt {}",
+                    "[EMULATOR] dropped seq={} stream={} path={} on attempt {}",
                     unacked[i].item.seq,
+                    unacked[i].stream_id,
                     new_path_id,
                     unacked[i].attempts
                 );
@@ -541,8 +581,9 @@ fn send_scheduled_packets(
                 let _ = telemetry.log(
                     "emulator_drop",
                     &format!(
-                        "seq={} path={} attempt={}",
+                        "seq={} stream={} path={} attempt={}",
                         unacked[i].item.seq,
+                        unacked[i].stream_id,
                         new_path_id,
                         unacked[i].attempts
                     ),
@@ -721,6 +762,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
     println!("              Create new stream");
     println!("  use <id>    Select stream");
     println!("  streams     List streams");
+    println!("  streamstats Show per-stream statistics");
     println!("  send <message>");
     println!("              Send using current stream defaults");
     println!("  stats       Show metrics and features");
@@ -800,6 +842,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 println!("              Create new stream");
                 println!("  use <id>    Select stream");
                 println!("  streams     List streams");
+                println!("  streamstats Show per-stream statistics");
                 println!("  send <message>");
                 println!("              Send using current stream defaults");
                 println!("  stats       Show metrics and features");
@@ -1010,6 +1053,24 @@ fn run_client(server_address: &str) -> io::Result<()> {
 
                 continue;
             }
+            "streamstats" => {
+                println!("Connection: {}", connection.status());
+
+                let text = connection.stream_stats_text();
+
+                if text.is_empty() {
+                    println!("No stream stats found.");
+                } else {
+                    println!("{}", text);
+                }
+
+                let _ = telemetry.log(
+                    "stream_stats",
+                    &text.replace('\n', " | "),
+                );
+
+                continue;
+            }
             "send" => {
                 if connection.state != ConnectionState::Connected {
                     println!("Connect first.");
@@ -1028,7 +1089,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                 }
 
                 let stream = match connection.streams.get(&connection.current_stream) {
-                    Some(stream) => *stream,
+                    Some(stream) => stream.clone(),
                     None => {
                         println!("Current stream not found.");
                         continue;
@@ -1066,6 +1127,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                     &mut metrics,
                     &mut emulator,
                     &mut multipath,
+                    &mut connection,
                 )?;
 
                 continue;
@@ -1424,6 +1486,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                         &mut metrics,
                         &mut emulator,
                         &mut multipath,
+                        &mut connection,
                     ) {
                         eprintln!("Experiment run failed: {}", e);
                         break;
@@ -1532,6 +1595,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
                     &mut metrics,
                     &mut emulator,
                     &mut multipath,
+                    &mut connection,
                 )?;
 
                 continue;
@@ -1601,6 +1665,7 @@ fn run_client(server_address: &str) -> io::Result<()> {
             &mut metrics,
             &mut emulator,
             &mut multipath,
+            &mut connection,
         )?;
     }
 
