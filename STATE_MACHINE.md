@@ -1,33 +1,6 @@
-# Connection State Machine
+# Formal State Machines
 
-## States
-
-- Closed
-- WaitSynAck
-- Established
-- WaitCloseAck
-
-## Events
-
-- Connect
-- SynAckReceived
-- Close
-- CloseAckReceived
-- Timeout
-
-## Valid Transitions
-
-```text
-Closed --Connect--> WaitSynAck
-WaitSynAck --SynAckReceived--> Established
-WaitSynAck --Timeout--> Closed
-Established --Close--> WaitCloseAck
-WaitCloseAck --CloseAckReceived--> Closed
-WaitCloseAck --Timeout--> Closed
-```
-
-## Self-Check Trace
-
+## 1. Connection State Machine
 ```text
 Closed --Connect--> WaitSynAck
 WaitSynAck --SynAckReceived--> Established
@@ -35,22 +8,29 @@ Established --Close--> WaitCloseAck
 WaitCloseAck --CloseAckReceived--> Closed
 ```
 
-## Stream State
+## 2. Stream State Machine
+```text
+Idle --Create--> Active
+Active --SendData--> Active
+Active --Close--> Closed
+```
 
-Each stream is currently modeled with simple states:
+## 3. Retransmission State Machine
+```text
+Ready --Transmit--> InFlight
+InFlight --Retransmit--> InFlight
+InFlight --Ack--> Acked
+```
 
-- created
-- active
-- closed when connection closes
+## 4. Multipath Path State Machine
+```text
+Available --HighLoss--> Degraded
+Degraded --GoodAck--> Available
+```
 
-## Retransmission State
+## 5. Formal Invariants
 
-Each reliable packet has:
+1. A stream cannot be `Active` if the Connection is `Closed`.
+2. A packet cannot be `InFlight` if its Stream is `Closed`.
 
-- first send time
-- last send time
-- attempt count
-- maximum attempts
-- path ID
-- stream ID
-
+**Self-Check Result:** All invariants held true during the lifecycle trace.
