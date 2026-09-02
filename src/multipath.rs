@@ -70,6 +70,12 @@ impl MultipathManager {
         }
     }
 
+    pub fn reset_stats(&mut self) {
+        for path in &mut self.paths {
+            path.stats = MultipathStats::default();
+        }
+    }
+
     pub fn status(&self) -> String {
         let state = if self.enabled { "enabled" } else { "disabled" };
 
