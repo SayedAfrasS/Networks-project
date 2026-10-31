@@ -7,6 +7,7 @@ pub struct Metrics {
     pub sent_best_effort: u64,
     pub sent_important: u64,
     pub sent_guaranteed: u64,
+    pub sent_adaptive: u64,
 
     pub acks: u64,
     pub losses: u64,
@@ -27,6 +28,7 @@ impl Metrics {
             sent_best_effort: 0,
             sent_important: 0,
             sent_guaranteed: 0,
+            sent_adaptive: 0,
 
             acks: 0,
             losses: 0,
@@ -53,6 +55,9 @@ impl Metrics {
             }
             Reliability::Guaranteed => {
                 self.sent_guaranteed = self.sent_guaranteed.saturating_add(1);
+            }
+            Reliability::Adaptive => {
+                self.sent_adaptive = self.sent_adaptive.saturating_add(1);
             }
         }
 
@@ -118,11 +123,12 @@ impl Metrics {
         }
 
         format!(
-            "sent_total={} be={} important={} guaranteed={} acks={} losses={} retransmits={} rtt_samples={} rtt_avg_us={} rtt_min_us={} rtt_max_us={} priorities={}",
+            "sent_total={} be={} important={} guaranteed={} adaptive={} acks={} losses={} retransmits={} rtt_samples={} rtt_avg_us={} rtt_min_us={} rtt_max_us={} priorities={}",
             self.sent_total,
             self.sent_best_effort,
             self.sent_important,
             self.sent_guaranteed,
+            self.sent_adaptive,
             self.acks,
             self.losses,
             self.retransmits,

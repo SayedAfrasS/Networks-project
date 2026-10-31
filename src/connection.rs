@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::jatde::StreamHealthInfo;
 use crate::packet::Reliability;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -98,6 +99,24 @@ impl ConnectionManager {
         ids.sort();
 
         ids
+    }
+
+    pub fn stream_health(&self, stream_id: u32) -> StreamHealthInfo {
+        if let Some(stream) = self.streams.get(&stream_id) {
+            StreamHealthInfo {
+                stream_id: stream.id,
+                priority: stream.priority,
+                sent_count: stream.stats.sent,
+                acked_count: stream.stats.acked,
+            }
+        } else {
+            StreamHealthInfo {
+                stream_id,
+                priority: 128,
+                sent_count: 0,
+                acked_count: 0,
+            }
+        }
     }
 
     pub fn status(&self) -> String {

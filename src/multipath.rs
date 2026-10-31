@@ -4,9 +4,10 @@ use std::net::UdpSocket;
 use std::time::Duration;
 
 use crate::emulator::{NetworkEmulator, SendOutcome};
+use crate::jatde::PathQualityInfo;
 use crate::packet::Reliability;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MultipathStats {
     pub acks: u64,
     pub losses: u64,
@@ -20,17 +21,19 @@ pub struct ManagedPath {
     pub name: String,
     pub enabled: bool,
     pub quality: f64,
+    pub cost_multiplier: f64,
     pub emulator: NetworkEmulator,
     pub stats: MultipathStats,
 }
 
 impl ManagedPath {
-    fn new(id: u8, name: &str, quality: f64) -> Self {
+    fn new(id: u8, name: &str, quality: f64, cost_multiplier: f64) -> Self {
         Self {
             id,
             name: name.to_string(),
             enabled: true,
             quality: quality.clamp(0.0, 1.0),
+            cost_multiplier: cost_multiplier.max(0.1),
             emulator: NetworkEmulator::new(),
             stats: MultipathStats::default(),
         }
@@ -38,6 +41,34 @@ impl ManagedPath {
 
     pub fn max_delay_ms(&self) -> u64 {
         self.emulator.max_delay_ms()
+    }
+
+    pub fn loss_rate(&self) -> f64 {
+        let total = self.stats.acks + self.stats.losses;
+        if total == 0 {
+            0.0
+        } else {
+            self.stats.losses as f64 / total as f64
+        }
+    }
+
+    pub fn avg_rtt_ms(&self) -> f64 {
+        if self.stats.rtt_samples == 0 {
+            0.0
+        } else {
+            (self.stats.rtt_sum_us as f64 / self.stats.rtt_samples as f64) / 1000.0
+        }
+    }
+
+    pub fn to_quality_info(&self) -> PathQualityInfo {
+        PathQualityInfo {
+            path_id: self.id,
+            quality: self.quality,
+            loss_rate: self.loss_rate(),
+            rtt_ms: self.avg_rtt_ms(),
+            cost_multiplier: self.cost_multiplier,
+            enabled: self.enabled,
+        }
     }
 
     pub fn status(&self) -> String {
@@ -64,8 +95,8 @@ impl MultipathManager {
         Self {
             enabled: false,
             paths: vec![
-                ManagedPath::new(0, "wifi", 0.90),
-                ManagedPath::new(1, "cellular", 0.70),
+                ManagedPath::new(0, "wifi", 0.90, 1.0),
+                ManagedPath::new(1, "cellular", 0.70, 1.5),
             ],
         }
     }
@@ -74,6 +105,10 @@ impl MultipathManager {
         for path in &mut self.paths {
             path.stats = MultipathStats::default();
         }
+    }
+
+    pub fn get_quality_infos(&self) -> Vec<PathQualityInfo> {
+        self.paths.iter().map(|p| p.to_quality_info()).collect()
     }
 
     pub fn status(&self) -> String {
@@ -123,11 +158,46 @@ impl MultipathManager {
                     path.emulator.set_jitter(100);
                 }
             }
+            "fading" => {
+                if let Some(path) = self.paths.get_mut(0) {
+                    path.emulator.set_loss(15.0);
+                    path.emulator.set_delay(40);
+                    path.emulator.set_jitter(30);
+                }
+                if let Some(path) = self.paths.get_mut(1) {
+                    path.emulator.set_loss(5.0);
+                    path.emulator.set_delay(60);
+                    path.emulator.set_jitter(10);
+                }
+            }
+            "surge" => {
+                if let Some(path) = self.paths.get_mut(0) {
+                    path.emulator.set_loss(40.0);
+                    path.emulator.set_delay(200);
+                    path.emulator.set_jitter(100);
+                }
+                if let Some(path) = self.paths.get_mut(1) {
+                    path.emulator.set_loss(10.0);
+                    path.emulator.set_delay(70);
+                    path.emulator.set_jitter(20);
+                }
+            }
+            "handover" => {
+                if let Some(path) = self.paths.get_mut(0) {
+                    path.enabled = false;
+                }
+                if let Some(path) = self.paths.get_mut(1) {
+                    path.enabled = true;
+                    path.emulator.set_loss(5.0);
+                    path.emulator.set_delay(50);
+                    path.emulator.set_jitter(10);
+                }
+            }
             _ => {}
         }
     }
 
-    fn best_path_id(&self) -> u8 {
+    pub fn best_path_id(&self) -> u8 {
         self.paths
             .iter()
             .filter(|p| p.enabled)
@@ -140,7 +210,7 @@ impl MultipathManager {
             .unwrap_or(0)
     }
 
-    fn secondary_path_id(&self) -> u8 {
+    pub fn secondary_path_id(&self) -> u8 {
         let mut enabled: Vec<&ManagedPath> =
             self.paths.iter().filter(|p| p.enabled).collect();
 
@@ -175,7 +245,7 @@ impl MultipathManager {
                     self.secondary_path_id()
                 }
             }
-            Reliability::Guaranteed => self.best_path_id(),
+            Reliability::Guaranteed | Reliability::Adaptive => self.best_path_id(),
         }
     }
 
@@ -254,7 +324,11 @@ mod tests {
         let best_effort_path =
             manager.choose_path(Reliability::BestEffort, 0);
 
+        let adaptive_path =
+            manager.choose_path(Reliability::Adaptive, 5);
+
         assert!(critical_path == 0 || critical_path == 1);
         assert!(best_effort_path == 0 || best_effort_path == 1);
+        assert!(adaptive_path == 0 || adaptive_path == 1);
     }
 }

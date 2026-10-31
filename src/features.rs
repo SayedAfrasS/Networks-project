@@ -2,6 +2,25 @@ use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormalizedFeatureVector {
+    pub rtt_trend_norm: f64,
+    pub rtt_inflation_norm: f64,
+    pub jitter_norm: f64,
+    pub loss_rate_norm: f64,
+}
+
+impl NormalizedFeatureVector {
+    pub fn as_array(&self) -> [f64; 4] {
+        [
+            self.rtt_trend_norm,
+            self.rtt_inflation_norm,
+            self.jitter_norm,
+            self.loss_rate_norm,
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Features {
     pub samples: usize,
@@ -10,22 +29,27 @@ pub struct Features {
     pub avg_rtt_us: u64,
     pub min_rtt_us: u64,
     pub max_rtt_us: u64,
+    pub ewma_rtt_us: u64,
 
     pub rtt_trend_us: i64,
     pub jitter_us: u64,
+    pub rtt_variance_us: u64,
 
     pub loss_rate: f64,
     pub risk: f64,
+    pub normalized: NormalizedFeatureVector,
 }
 
 pub struct FeatureExtractor {
     window_size: usize,
     rtt_window: VecDeque<u64>,
     outcome_window: VecDeque<bool>,
+    ewma_rtt_us: Option<f64>,
+    rtt_variance: Option<f64>,
 }
 
-fn clamp01(value: f64) -> f64 {
-    if value < 0.0 {
+pub fn clamp01(value: f64) -> f64 {
+    if !value.is_finite() || value < 0.0 {
         0.0
     } else if value > 1.0 {
         1.0
@@ -42,6 +66,8 @@ impl FeatureExtractor {
             window_size,
             rtt_window: VecDeque::with_capacity(window_size),
             outcome_window: VecDeque::with_capacity(window_size),
+            ewma_rtt_us: None,
+            rtt_variance: None,
         }
     }
 
@@ -59,6 +85,22 @@ impl FeatureExtractor {
         if self.outcome_window.len() > self.window_size {
             self.outcome_window.pop_front();
         }
+
+        let rtt_f = rtt_us as f64;
+        match self.ewma_rtt_us {
+            None => {
+                self.ewma_rtt_us = Some(rtt_f);
+                self.rtt_variance = Some(rtt_f / 2.0);
+            }
+            Some(ewma) => {
+                let alpha = 0.125;
+                let beta = 0.25;
+                let diff = (rtt_f - ewma).abs();
+                self.ewma_rtt_us = Some((1.0 - alpha) * ewma + alpha * rtt_f);
+                let current_var = self.rtt_variance.unwrap_or(0.0);
+                self.rtt_variance = Some((1.0 - beta) * current_var + beta * diff);
+            }
+        }
     }
 
     pub fn record_loss(&mut self) {
@@ -69,7 +111,7 @@ impl FeatureExtractor {
         }
     }
 
-    fn loss_rate(&self) -> f64 {
+    pub fn loss_rate(&self) -> f64 {
         if self.outcome_window.is_empty() {
             return 0.0;
         }
@@ -85,11 +127,17 @@ impl FeatureExtractor {
 
     pub fn features(&self) -> Features {
         let samples = self.rtt_window.len();
-
         let loss_rate = self.loss_rate();
+        let loss_norm = clamp01(loss_rate * 2.0);
 
         if samples == 0 {
             let risk = clamp01(loss_rate * 2.0);
+            let normalized = NormalizedFeatureVector {
+                rtt_trend_norm: 0.0,
+                rtt_inflation_norm: 0.0,
+                jitter_norm: 0.0,
+                loss_rate_norm: loss_norm,
+            };
 
             return Features {
                 samples: 0,
@@ -97,10 +145,13 @@ impl FeatureExtractor {
                 avg_rtt_us: 0,
                 min_rtt_us: 0,
                 max_rtt_us: 0,
+                ewma_rtt_us: 0,
                 rtt_trend_us: 0,
                 jitter_us: 0,
+                rtt_variance_us: 0,
                 loss_rate,
                 risk,
+                normalized,
             };
         }
 
@@ -121,15 +172,12 @@ impl FeatureExtractor {
         }
 
         let avg_rtt_us = (sum / samples as u128) as u64;
-
         let latest_rtt_us = *self.rtt_window.back().unwrap_or(&0);
-
         let first_rtt_us = *self.rtt_window.front().unwrap_or(&0);
 
         let rtt_trend_us = if samples >= 2 {
             let trend = (latest_rtt_us as i128 - first_rtt_us as i128)
                 / (samples as i128 - 1);
-
             trend as i64
         } else {
             0
@@ -151,7 +199,6 @@ impl FeatureExtractor {
                 };
 
                 diff_sum = diff_sum.saturating_add(diff as u128);
-
                 previous = *current;
             }
 
@@ -162,28 +209,36 @@ impl FeatureExtractor {
 
         let avg_for_risk = avg_rtt_us.max(1000) as f64;
 
-        let trend_risk = if rtt_trend_us > 0 {
+        let trend_norm = if rtt_trend_us > 0 {
             clamp01(rtt_trend_us as f64 / avg_for_risk)
         } else {
             0.0
         };
 
-        let inflation_risk = if min_rtt_us > 0 && latest_rtt_us > min_rtt_us {
+        let inflation_norm = if min_rtt_us > 0 && latest_rtt_us > min_rtt_us {
             clamp01((latest_rtt_us as f64 / min_rtt_us as f64) - 1.0)
         } else {
             0.0
         };
 
-        let jitter_risk = clamp01(jitter_us as f64 / avg_for_risk);
-
-        let loss_risk = clamp01(loss_rate * 2.0);
+        let jitter_norm = clamp01(jitter_us as f64 / avg_for_risk);
 
         let risk = clamp01(
-            0.35 * trend_risk
-                + 0.25 * inflation_risk
-                + 0.20 * jitter_risk
-                + 0.20 * loss_risk,
+            0.35 * trend_norm
+                + 0.25 * inflation_norm
+                + 0.20 * jitter_norm
+                + 0.20 * loss_norm,
         );
+
+        let normalized = NormalizedFeatureVector {
+            rtt_trend_norm: trend_norm,
+            rtt_inflation_norm: inflation_norm,
+            jitter_norm,
+            loss_rate_norm: loss_norm,
+        };
+
+        let ewma_rtt_us = self.ewma_rtt_us.unwrap_or(avg_rtt_us as f64) as u64;
+        let rtt_variance_us = self.rtt_variance.unwrap_or(0.0) as u64;
 
         Features {
             samples,
@@ -191,10 +246,13 @@ impl FeatureExtractor {
             avg_rtt_us,
             min_rtt_us,
             max_rtt_us,
+            ewma_rtt_us,
             rtt_trend_us,
             jitter_us,
+            rtt_variance_us,
             loss_rate,
             risk,
+            normalized,
         }
     }
 }
@@ -220,5 +278,20 @@ mod tests {
 
         assert!(features.loss_rate > 0.0);
         assert!(features.jitter_us > 0);
+        assert!(features.normalized.jitter_norm >= 0.0 && features.normalized.jitter_norm <= 1.0);
+        assert!(features.normalized.loss_rate_norm >= 0.0 && features.normalized.loss_rate_norm <= 1.0);
+    }
+
+    #[test]
+    fn normalized_feature_bounds() {
+        let mut extractor = FeatureExtractor::new(4);
+        for i in 1..=10 {
+            extractor.record_ack(Duration::from_micros(i * 1000));
+        }
+        let f = extractor.features();
+        let arr = f.normalized.as_array();
+        for &val in &arr {
+            assert!(val >= 0.0 && val <= 1.0, "value {} out of bounds", val);
+        }
     }
 }

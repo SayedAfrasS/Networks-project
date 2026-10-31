@@ -13,11 +13,12 @@ pub const TYPE_CLOSE_ACK: u8 = 5;
 
 pub const HEADER_LEN: usize = 28;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reliability {
     BestEffort,
     Important,
     Guaranteed,
+    Adaptive,
 }
 
 impl Reliability {
@@ -26,6 +27,7 @@ impl Reliability {
             Reliability::BestEffort => 0,
             Reliability::Important => 1,
             Reliability::Guaranteed => 2,
+            Reliability::Adaptive => 3,
         }
     }
 
@@ -34,6 +36,7 @@ impl Reliability {
             0 => Some(Reliability::BestEffort),
             1 => Some(Reliability::Important),
             2 => Some(Reliability::Guaranteed),
+            3 => Some(Reliability::Adaptive),
             _ => None,
         }
     }
@@ -43,11 +46,20 @@ impl Reliability {
             "be" | "best" | "besteffort" => Some(Reliability::BestEffort),
             "important" | "imp" => Some(Reliability::Important),
             "guaranteed" | "reliable" | "rel" => Some(Reliability::Guaranteed),
+            "adaptive" | "adapt" | "auto" | "jatde" => Some(Reliability::Adaptive),
             _ => None,
+        }
+    }
+
+    pub fn is_reliable(self) -> bool {
+        match self {
+            Reliability::BestEffort => false,
+            Reliability::Important | Reliability::Guaranteed | Reliability::Adaptive => true,
         }
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Packet {
     pub version: u8,
     pub ptype: u8,
@@ -105,7 +117,7 @@ pub fn decode_packet(buffer: &[u8]) -> Result<Packet, String> {
     let ptype = buffer[1];
 
     let reliability = Reliability::from_u8(buffer[2])
-        .ok_or_else(|| "invalid reliability value".to_string())?;
+        .ok_or_else(|| format!("invalid reliability value: {}", buffer[2]))?;
 
     let priority = buffer[3];
 
@@ -187,5 +199,39 @@ mod tests {
         assert_eq!(decoded.seq, 33);
         assert_eq!(decoded.ack, 0);
         assert_eq!(decoded.payload, payload.to_vec());
+    }
+
+    #[test]
+    fn packet_adaptive_roundtrip() {
+        let payload = b"adaptive_payload";
+
+        let encoded = encode_packet(
+            TYPE_DATA,
+            Reliability::Adaptive,
+            9,
+            42,
+            100,
+            500,
+            499,
+            payload,
+        );
+
+        let decoded = decode_packet(&encoded).expect("packet should decode");
+
+        assert_eq!(decoded.reliability, Reliability::Adaptive);
+        assert_eq!(decoded.priority, 9);
+        assert_eq!(decoded.connection_id, 42);
+        assert_eq!(decoded.stream_id, 100);
+        assert_eq!(decoded.seq, 500);
+        assert_eq!(decoded.ack, 499);
+    }
+
+    #[test]
+    fn reliability_parsing() {
+        assert_eq!(Reliability::parse("adaptive"), Some(Reliability::Adaptive));
+        assert_eq!(Reliability::parse("auto"), Some(Reliability::Adaptive));
+        assert_eq!(Reliability::parse("be"), Some(Reliability::BestEffort));
+        assert_eq!(Reliability::parse("guaranteed"), Some(Reliability::Guaranteed));
+        assert_eq!(Reliability::parse("unknown_string"), None);
     }
 }
